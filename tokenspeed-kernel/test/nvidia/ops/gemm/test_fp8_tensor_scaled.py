@@ -21,15 +21,15 @@
 """Per-tensor scaled FP8 GEMM selection and its FlashInfer cuBLASLt kernel."""
 
 import pytest
-import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.gemm import _gemm_format_signature
 from tokenspeed_kernel.ops.gemm import flashinfer as flashinfer_ops
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.selection import select_kernel
 
 pytestmark = pytest.mark.skipif(
-    flashinfer_ops.bmm_fp8 is flashinfer_ops.error_fn,
-    reason="FlashInfer bmm_fp8 needs a Blackwell NVIDIA GPU",
+    flashinfer_ops.cublas_fp8_gemm is flashinfer_ops.error_fn,
+    reason="FlashInfer cuBLASLt FP8 GEMM needs a Blackwell NVIDIA GPU",
 )
 
 
@@ -46,7 +46,7 @@ def _operands(m: int, k: int, n: int):
 @pytest.mark.parametrize("m", [1, 7, 256])
 def test_column_major_weights_select_cublaslt_and_match_the_reference(m):
     a, b, a_scale, b_scale, expected = _operands(m, 512, 384)
-    out = tokenspeed_kernel.mm(
+    out = kernel_mm(
         a, b, A_scales=a_scale, B_scales=b_scale, out_dtype=torch.bfloat16, quant="fp8"
     )
     error = (out.float() - expected).norm() / expected.norm()
@@ -63,7 +63,7 @@ def test_column_major_weights_select_cublaslt_and_match_the_reference(m):
 def test_row_major_weights_fall_to_the_general_kernel():
     a, b, a_scale, b_scale, expected = _operands(4, 512, 384)
     b = b.contiguous()
-    out = tokenspeed_kernel.mm(
+    out = kernel_mm(
         a, b, A_scales=a_scale, B_scales=b_scale, out_dtype=torch.bfloat16, quant="fp8"
     )
     assert ((out.float() - expected).norm() / expected.norm()).item() < 1e-2

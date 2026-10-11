@@ -171,7 +171,9 @@ def test_the_loader_checks_the_scale_file_of_an_fp8_cache(
         kv_cache_dtype=kv_cache_dtype, quantization_param_path=path
     )
     with pytest.raises(RuntimeError, match="would load now"):
-        weight_loader.WeightLoader.load_model(None, server_args, "cuda", 0, None)
+        weight_loader.WeightLoader.load_model(
+            None, server_args, "cuda", 0, None, checkpoint_load_group=None
+        )
     assert checks == ([path] if checked else [])
 
 
@@ -179,6 +181,7 @@ def test_a_checkpoint_load_rejects_a_non_unit_kv_scale(tmp_path):
     from safetensors.torch import save_file
 
     from tokenspeed.runtime.configs.load_config import LoadConfig
+    from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.model_loader.loader import DefaultModelLoader
 
     save_file(
@@ -190,7 +193,9 @@ def test_a_checkpoint_load_rejects_a_non_unit_kv_scale(tmp_path):
     )
     loader = DefaultModelLoader(LoadConfig())
     model = SimpleNamespace(fall_back_to_pt_during_load=False, secondary_weights=())
-    model_config = SimpleNamespace(model_path=str(tmp_path), revision=None)
+    model_config = SimpleNamespace(
+        model_path=str(tmp_path), revision=None, mapping=Mapping(rank=0)
+    )
     with pytest.raises(ValueError, match="k_proj.k_scale"):
         list(loader._get_all_weights(model_config, model))
 

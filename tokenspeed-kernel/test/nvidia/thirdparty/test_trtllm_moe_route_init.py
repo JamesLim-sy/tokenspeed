@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compatibility and isolation checks for the private routing initializer."""
+"""Compatibility and isolation checks for the private MoE tactic policy."""
 
 import functools
 import inspect
@@ -28,45 +28,13 @@ import torch
 from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
     _clone,
     _entrypoints,
-    _initialize_routing_map,
     _prefer_qwen38_decode_tile_32,
     _register_private,
     _require_runner_rebinding,
     _require_tactic_hooks,
 )
 
-_ALLOCATION = """
-  void prepare_routing_common() {
-    expanded_idx_to_permuted_idx = alloc_tensor({num_tokens * top_k}, dl_int32, device);
-    permuted_idx_to_token_idx =
-        alloc_tensor({max_num_padded_tokens + 1}, dl_int32, hidden_states.device());
-    prepare_other_workspace();
-  }
-"""
-
 _CLONE_VALUE = object()
-
-
-@pytest.mark.parametrize("guard", [" + 1", ""])
-def test_initializer_uses_native_capacity_and_stream(guard):
-    source = _ALLOCATION.replace(" + 1", guard)
-    actual = _initialize_routing_map(source)
-    assert actual.count("cudaMemsetAsync(") == 1
-    assert "permuted_idx_to_token_idx.numel()" in actual
-    assert "get_stream(hidden_states.device())" in actual
-    assert "data_ptr(), 0xff," in actual
-    assert actual.index("cudaMemsetAsync(") > actual.index("alloc_tensor({max_num")
-    assert actual.index("cudaMemsetAsync(") < actual.index("prepare_other_workspace()")
-    # The original allocation, including upstream's optional guard, is retained.
-    assert source[: source.index("    prepare_other_workspace")] in actual
-
-
-@pytest.mark.parametrize(
-    "source", ["", _ALLOCATION * 2, _ALLOCATION.replace("dl_int32", "dl_int64")]
-)
-def test_unrecognized_native_allocation_fails_closed(source):
-    with pytest.raises(RuntimeError, match="expected exactly one"):
-        _initialize_routing_map(source)
 
 
 def test_function_rebinding_does_not_mutate_upstream():

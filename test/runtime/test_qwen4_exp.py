@@ -430,7 +430,6 @@ def test_qwen4_exp_qsa_backend_resolution_pins_sparse_dispatch() -> None:
             is_kda=False,
             is_dsa=False,
             is_qsa=True,
-            has_cache_plan=True,
         )
         == "qsa"
     )
@@ -440,7 +439,6 @@ def test_qwen4_exp_qsa_backend_resolution_pins_sparse_dispatch() -> None:
             is_kda=False,
             is_dsa=False,
             is_qsa=True,
-            has_cache_plan=True,
         )
         == "qsa"
     )
@@ -583,6 +581,8 @@ def _qsa_extend_round(router: CacheGroupRouter, block_tables: dict, seq_lens) ->
         extend_replay_lens_cpu=torch.zeros_like(seq_lens - 1),
         extend_prompt_lens_cpu=seq_lens - 1 + ones,
         extend_with_prefix=True,
+        query_shard=None,
+        block_tables_cpu={},
     )
 
 
@@ -2265,7 +2265,9 @@ def test_ngram_ids_anchor_rewrite_matches_legacy(ngram_size) -> None:
 )
 @pytest.mark.parametrize("ngram_size", [2, 3, 4])
 @pytest.mark.parametrize("heads_per_ngram", [1, 3, 8])
-@pytest.mark.parametrize("lengths", [[1, 1, 1, 1], [3, 1, 5], [0, 4, 2], [0, 0]])
+@pytest.mark.parametrize(
+    "lengths", [[1, 1, 1, 1], [3, 1, 5], [0, 4, 2], [0, 0], [1476], [1620]]
+)
 def test_ngram_ids_flat_kernel_matches_legacy(
     ngram_size, heads_per_ngram, lengths
 ) -> None:

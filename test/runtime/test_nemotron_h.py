@@ -32,7 +32,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
-from tokenspeed_kernel.ops.gemm.fp8_utils import static_quant_fp8
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import Mamba2Config
@@ -106,6 +106,18 @@ def test_mamba2_component_maps_ssd_geometry_onto_the_linear_fields():
     assert mamba2.conv_dim == 2 * 2 * 16 + 8 * 4
     assert mamba2.conv_state_shape == (mamba2.conv_dim // 2, 3)
     assert mamba2.temporal_state_shape == (4, 4, 16)
+
+
+def test_mamba2_component_reads_a_1e30_dt_bound_as_unbounded():
+    config = _config(time_step_limit=(0.0, 1e30))
+    model_config = SimpleNamespace(hf_text_config=config)
+    server_args = SimpleNamespace(
+        mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=1))
+    )
+    assert Mamba2Config.generate(server_args, model_config).dt_limit == (
+        0.0,
+        float("inf"),
+    )
 
 
 def test_non_gated_expert_plan_loads_up_proj_as_all_of_w13():
@@ -238,6 +250,7 @@ def _backend(
     *,
     verify_width: int = 1,
     replay_ssm: bool = False,
+    draft_tree: bool = False,
 ):
     from tokenspeed.runtime.layers.attention.backends.state.mamba2 import (
         Mamba2AttnBackend,
@@ -259,6 +272,7 @@ def _backend(
         chunk_size=128,
         dt_limit=(0.0, float("inf")),
         replay_ssm=replay_ssm,
+        draft_tree=draft_tree,
     )
     config = AttnConfig(
         device="cuda",
@@ -458,7 +472,9 @@ def _super_attn_config(tp: int, kv_dtype: torch.dtype, *, is_draft: bool, device
     )
 
 
-def _super_cache_recipe(tp: int, kv_dtype: torch.dtype, *, draft_tokens: int):
+def _super_cache_recipe(
+    tp: int, kv_dtype: torch.dtype, *, draft_tokens: int, topk: int = 1
+):
     """The Mamba2 recipe, with one MTP draft layer when ``draft_tokens`` is set."""
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         cache_recipe,
@@ -473,6 +489,7 @@ def _super_cache_recipe(tp: int, kv_dtype: torch.dtype, *, draft_tokens: int):
             prefix_granularity=128,
             max_total_tokens=None,
             speculative_num_draft_tokens=draft_tokens,
+            speculative_eagle_topk=topk,
             enable_replay_ssm=with_draft,
         ),
         model_config=SimpleNamespace(
@@ -535,6 +552,15 @@ def test_mamba2_cache_plan_packs_state_and_kv_without_state_padding(tp, kv_dtype
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mamba2_tree_plans_no_node_state_workspace():
+    """A Mamba2 tree verify replays a branch's ancestors, so no node states are planned."""
+    chain = _super_cache_recipe(1, torch.float8_e4m3fn, draft_tokens=8)
+    tree = _super_cache_recipe(1, torch.float8_e4m3fn, draft_tokens=8, topk=2)
+    assert tree.draft_tree and tree.replay_ssm
+    assert tree.setup().fixed_workspace_bytes == chain.setup().fixed_workspace_bytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mamba2_cache_plan_places_the_mtp_layer_and_replays_ssm():
     """The MTP attention layer joins the first KV group; verify stages only conv windows."""
     recipe = _super_cache_recipe(1, torch.float8_e4m3fn, draft_tokens=4)
@@ -588,7 +614,7 @@ def test_gated_norm_quantizes_for_a_static_fp8_out_proj():
     )
 
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
-    expected, _ = static_quant_fp8(out, scale)
+    expected, _ = quantize_fp8(out, scale=scale)
     assert torch.equal(out_fp8.view(torch.uint8), expected.view(torch.uint8))
 
 
@@ -618,7 +644,7 @@ def test_add_norm_folds_both_moe_halves_into_the_residual(with_fp8: bool):
     torch.testing.assert_close(normed.float(), ref, atol=2e-2, rtol=2e-2)
     assert (normed_fp8 is not None) == with_fp8
     if with_fp8:
-        expected, _ = static_quant_fp8(normed, scale)
+        expected, _ = quantize_fp8(normed, scale=scale)
         assert torch.equal(normed_fp8.view(torch.uint8), expected.view(torch.uint8))
 
 
@@ -709,6 +735,70 @@ def test_quantized_fc2_sees_the_reduced_latent_and_counts_once(
         assert out is None
 
 
+def test_moe_without_a_latent_runs_the_experts_on_the_input():
+    """Without ``moe_latent_size`` the routed experts take and return full-width rows."""
+    from tokenspeed.runtime.models import nemotron_h
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
+    seen = {}
+    moe = SimpleNamespace(
+        stream_fork=StreamFork(torch.cuda.Stream()),
+        gate=lambda x: x * 3,
+        shared_experts=lambda x: x * 2,
+        fc1_latent_proj=None,
+        _routed=lambda x, logits, latent, ctx: seen.setdefault("latent", latent),
+    )
+    hidden = torch.arange(8.0, device="cuda").view(2, 4)
+    routed, shared = nemotron_h.NemotronHMoE.forward(moe, hidden, None, None)
+    assert seen["latent"] is hidden and routed is hidden
+    assert torch.equal(shared, hidden * 2)
+
+    experts_out = torch.ones(2, 4)
+    moe = SimpleNamespace(
+        topk=lambda x, logits: None,
+        comm_manager=SimpleNamespace(get_num_tokens=lambda ctx: (2, 2)),
+        experts=lambda **kwargs: experts_out,
+        fc2_latent_proj=None,
+    )
+    assert (
+        nemotron_h.NemotronHMoE._routed(moe, hidden, None, hidden, None) is experts_out
+    )
+
+
+@pytest.mark.parametrize("graph_phase,capture", [(False, False), (True, True)])
+def test_router_and_shared_expert_run_beside_fc1_only_in_decode_graphs(
+    monkeypatch: pytest.MonkeyPatch, graph_phase: bool, capture: bool
+):
+    """Graph capture runs the router and shared expert on the aux stream beside fc1."""
+    from tokenspeed.runtime.models import nemotron_h
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
+    monkeypatch.setattr(nemotron_h, "get_is_cuda_graph_phase", lambda: graph_phase)
+    monkeypatch.setattr(nemotron_h, "get_is_capture_mode", lambda: capture)
+    aux = torch.cuda.Stream()
+    streams = {}
+
+    def record(name, value):
+        streams[name] = torch.cuda.current_stream()
+        return value
+
+    moe = SimpleNamespace(
+        stream_fork=StreamFork(aux),
+        gate=lambda x: record("gate", x * 3),
+        shared_experts=lambda x: record("shared", x * 2),
+        fc1_latent_proj=lambda x: (record("fc1", x - 1), None),
+        _routed=lambda x, logits, latent, ctx: record("routed", logits + latent),
+    )
+    hidden = torch.arange(8.0, device="cuda").view(2, 4)
+    out_routed, out_shared = nemotron_h.NemotronHMoE.forward(moe, hidden, None, None)
+    torch.cuda.synchronize()
+    assert torch.equal(out_routed, hidden * 4 - 1)
+    assert torch.equal(out_shared, hidden * 2)
+    main = torch.cuda.current_stream()
+    side = aux if graph_phase else main
+    assert streams == {"gate": side, "shared": side, "fc1": main, "routed": main}
+
+
 @pytest.mark.parametrize(
     "blocks",
     [
@@ -781,10 +871,22 @@ def test_mamba2_decode_reads_the_projection_view_in_place():
     indices = torch.tensor([1, 2, 3], device="cuda", dtype=torch.int32)
 
     compact = causal_conv1d_update(
-        view.clone(), compact_states, weight, None, "silu", conv_state_indices=indices
+        view.clone(),
+        compact_states,
+        weight,
+        None,
+        "silu",
+        conv_state_indices=indices,
+        parent_indices=None,
     )
     strided = causal_conv1d_update(
-        view, states, weight, None, "silu", conv_state_indices=indices
+        view,
+        states,
+        weight,
+        None,
+        "silu",
+        conv_state_indices=indices,
+        parent_indices=None,
     )
     assert strided.data_ptr() == view.data_ptr()
     assert torch.equal(strided, compact)
@@ -912,11 +1014,15 @@ def test_mamba2_verify_scan_continues_each_request_from_its_committed_state(repl
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_mamba2_replay_commit_matches_the_staged_verify_states(state_dtype):
+@pytest.mark.parametrize("tree", [False, True])
+def test_mamba2_replay_commit_matches_the_staged_verify_states(state_dtype, tree):
     """Verify then commit through the backend: replayed pages equal the staged ones."""
     from test.runtime.test_gdn_state_paging import _ContractPool
 
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeVerifyInputs,
+    )
 
     heads, head_dim, groups, d_state, steps, batch = 8, 64, 2, 128, 3, 2
     key_dim, value_dim = groups * d_state, heads * head_dim
@@ -935,11 +1041,29 @@ def test_mamba2_replay_commit_matches_the_staged_verify_states(state_dtype):
     for name in ("mixed_qkv", "conv_weights", "a"):
         inputs[name] = inputs[name].bfloat16()
     tables = torch.tensor([[1, 5], [2, 6]], dtype=torch.int32, device="cuda")
+    parents = torch.tensor([[-1, 0, 0], [-1, 0, 1]], dtype=torch.int32, device="cuda")
+    # Request 0 accepts the branch 0 -> 2; request 1 the whole chain 0 -> 1 -> 2.
+    path = torch.tensor([[0, 2, -1], [0, 1, 2]], dtype=torch.int32, device="cuda")
+    accepted = torch.tensor([2, 3] if tree else [1, 3], dtype=torch.int32)
     outputs, pools = [], []
     for replay in (True, False):
         backend = _backend(
-            heads, head_dim, groups, d_state, verify_width=steps, replay_ssm=replay
+            heads,
+            head_dim,
+            groups,
+            d_state,
+            verify_width=steps,
+            replay_ssm=replay,
+            draft_tree=tree,
         )
+        if tree:
+            backend.bind_tree_verify(
+                TreeVerifyInputs(
+                    torch.zeros(batch * steps, dtype=torch.int64, device="cuda"),
+                    steps,
+                    parent=parents,
+                )
+            )
         pool = _ContractPool(
             4,
             {0: ("linear_attention", conv.bfloat16(), ssm.to(state_dtype))},
@@ -982,8 +1106,11 @@ def test_mamba2_replay_commit_matches_the_staged_verify_states(state_dtype):
             )
         )
         backend.commit_verified_state(
-            torch.tensor([1, 3], dtype=torch.int32, device="cuda")
+            accepted.cuda(), accepted_path=path if tree else None
         )
+        if tree:
+            # Branches replay their ancestors; no node-state workspace exists.
+            assert backend._tree_node_states is None
         pools.append(pool)
     torch.cuda.synchronize()
 
@@ -1039,7 +1166,7 @@ def test_static_per_tensor_checkpoint_runs_a_merged_projection(
     assert error.item() < 1e-2
 
     # A producer that already quantized with the layer's scale gets the same GEMM.
-    x_prequantized, _ = static_quant_fp8(x, layer.input_scale)
+    x_prequantized, _ = quantize_fp8(x, scale=layer.input_scale)
     out_prequantized = method.apply(layer, x_prequantized)
     assert out_prequantized.dtype == torch.bfloat16
     assert torch.equal(out_prequantized, out)

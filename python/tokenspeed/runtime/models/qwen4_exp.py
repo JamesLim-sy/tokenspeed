@@ -76,9 +76,6 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeSparseMoeBlock,
 )
 from tokenspeed.runtime.models.utils import validate_attention_partition
-from tokenspeed.runtime.moe.distribution_recorder import (
-    get_global_expert_distribution_recorder,
-)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import add_prefix
 
@@ -311,6 +308,8 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
             layer_id=layer_id,
             is_moe=self.is_moe,
             prev_is_moe=self.is_moe,
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
         if _qwen4_exp_uses_sigmoid_output_gate(config):
             self.linear_attn.norm = _Qwen4ExpRMSNormGated(
@@ -332,7 +331,7 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
             hidden_states, residual, input_ids, ctx
         )
         attention_output = (
-            mixed if ctx.forward_mode.is_idle() else self.linear_attn(mixed, ctx)
+            mixed if ctx.forward_mode.is_idle() else self.linear_attn(mixed, None, ctx)
         )
         mixed, residuals = self._finish_attention(attention_output, residuals, ctx)
         return self._run_mlp(mixed, residuals, ctx)
@@ -444,6 +443,8 @@ class Qwen4ExpAttentionDecoderLayer(
             layer_id=layer_id,
             is_moe=self.is_moe,
             prev_is_moe=self.is_moe,
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
         self.indexer = None
         if getattr(config, "indexer_n_heads", None) is not None:
@@ -559,14 +560,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 next_ple = self.layers[layer_id + 1].ple
                 if next_ple is not None:
                     self._start_ple_prefetch(next_ple, input_ids, ctx)
-            with get_global_expert_distribution_recorder().with_current_layer(layer_id):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    ctx=ctx,
-                    input_ids=input_ids,
-                )
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                ctx=ctx,
+                input_ids=input_ids,
+            )
             if (
                 input_deepstack_embeds is not None
                 and input_deepstack_embeds.numel()

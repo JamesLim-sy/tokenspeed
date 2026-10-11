@@ -30,6 +30,8 @@ from __future__ import annotations
 import pytest
 import torch
 from kimi3_reference import mxfp4_moe_reference
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from utils import make_mxfp4_moe_weights
 
 NUM_EXPERTS = 8
@@ -229,9 +231,8 @@ def test_flashinfer_situ_kernel_routing_deferred_matches_finalized() -> None:
 
 @requires_flashinfer_situ
 def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
-    import tokenspeed_kernel
 
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -244,6 +245,7 @@ def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_mxfp4_situ_moe_apply"
     assert plan["support_routing"] is True
@@ -255,7 +257,7 @@ def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
 def test_situ_dispatch_autotune_preserves_normal_output(
     monkeypatch, precomputed
 ) -> None:
-    import tokenspeed_kernel
+
     from tokenspeed_kernel.ops import tuning
 
     raw, hidden_states, router_logits, bias, topk_ids, topk_weights = (
@@ -265,7 +267,7 @@ def test_situ_dispatch_autotune_preserves_normal_output(
     hidden_states, router_logits = hidden_states.cuda(), router_logits.cuda()
     topk_ids, topk_weights = topk_ids.cuda(), topk_weights.cuda()
     w._situ_output_buffer = torch.empty_like(hidden_states)
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -279,6 +281,7 @@ def test_situ_dispatch_autotune_preserves_normal_output(
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
         fp8_scale_block_shape=None,
         internal_activation_dtype="fp8",
         with_bias=False,
@@ -291,7 +294,7 @@ def test_situ_dispatch_autotune_preserves_normal_output(
     monkeypatch.setattr(tuning, "_autotune_max_num_tokens", 32)
 
     def apply():
-        return tokenspeed_kernel.moe_apply(
+        return kernel_moe_apply(
             plan,
             hidden_states,
             w,
