@@ -61,6 +61,7 @@ from tokenspeed.runtime.layers.attention.dcp.comm import (
     combine_attention_partials,
     gather_query_heads,
 )
+from tokenspeed.runtime.layers.attention.dcp.indexer import DCPIndexerMetadata
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     owned_history_rows,
@@ -184,6 +185,7 @@ class DSABackend(PagedAttentionBackend):
         # history gather packs rows in it and hands the indexer that form.
         self.index_k_format = spec.index_k_format
         self.query_shard_metadata: DSAQueryShardMetadata | None = None
+        self._dcp_indexer: DCPIndexerMetadata | None = None
         # Allocated by the target leaf (preallocate_history_gather_workspace),
         # shared with the draft leaf (adopt_history_gather_workspace).
         self._history_workspace: HistoryGatherWorkspace | None = None
@@ -350,6 +352,12 @@ class DSABackend(PagedAttentionBackend):
         if self.kpool_runtime is not None:
             self.kpool_runtime.reset_forward(req_pool_indices)
 
+    def require_dcp_indexer_metadata(self) -> DCPIndexerMetadata:
+        """Return this cache group's memo for the current decode forward."""
+        if self._dcp_indexer is None:
+            raise RuntimeError("DSA DCP decode metadata was not refreshed")
+        return self._dcp_indexer
+
     def require_kpool_runtime(self) -> KPoolRuntime:
         """Return the configured KPool runtime for sparse pooled indexing."""
         if self.kpool_runtime is None:
@@ -426,6 +434,7 @@ class DSABackend(PagedAttentionBackend):
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self._prefill_page_table = None
+        self._dcp_indexer = None
         self.query_shard_metadata = None
         self.dcp_block_granularity = None
         self.dcp_virtual_block_count = None
@@ -469,6 +478,7 @@ class DSABackend(PagedAttentionBackend):
             for_graph_replay=for_graph_replay,
         )
         metadata = self.forward_decode_metadata
+        self._dcp_indexer = DCPIndexerMetadata() if len(self.dcp_group) > 1 else None
         if metadata._dsa_seq_lens_2d is None:
             # First refresh at a lazily-built bs (no capture ran): allocate the
             # per-token rows once on the dense leaf's per-bs view; later
@@ -511,6 +521,7 @@ class DSABackend(PagedAttentionBackend):
         if metadata is None or metadata.seq_lens_k is None:
             raise RuntimeError("DSA draft decode metadata was not initialized")
         metadata.seq_lens_k.copy_(seq_lens[: metadata.seq_lens_k.numel()])
+        self._dcp_indexer = DCPIndexerMetadata() if len(self.dcp_group) > 1 else None
 
         dsa_plan(
             seq_lens_2d=metadata.seq_lens_k.unsqueeze(1),
@@ -536,6 +547,7 @@ class DSABackend(PagedAttentionBackend):
             )
         bs = metadata.seq_lens_k.numel()
         metadata.seq_lens_k.copy_(frontier[:bs])
+        self._dcp_indexer = DCPIndexerMetadata() if len(self.dcp_group) > 1 else None
         self._publish_k_row_indexer_rows(metadata, frontier, bs)
 
     def init_forward_metadata(
@@ -578,6 +590,7 @@ class DSABackend(PagedAttentionBackend):
             page_table_cpu=None,
             **kwargs,
         )
+        self._dcp_indexer = None
         self.query_shard_metadata = None
         if query_shard is not None and query_shard.size > 1:
             if forward_mode.is_mixed():
@@ -604,6 +617,9 @@ class DSABackend(PagedAttentionBackend):
         # after this init (the unified draft contract).
         if forward_mode.is_mixed() and not self.is_draft:
             metadata = self.forward_decode_metadata
+            self._dcp_indexer = (
+                DCPIndexerMetadata() if len(self.dcp_group) > 1 else None
+            )
             # Per-token context lengths: the paged-MQA-logits kernel only supports
             # next_n == 1, so each verify token is its own row (bs * spec_num_tokens
             # rows).

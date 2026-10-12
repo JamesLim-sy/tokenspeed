@@ -586,22 +586,23 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         placement = ctx.attn_backend.cache_placement(self.attn_mqa)
         if placement is not None:
             page_size = ctx.token_to_kv_pool.arena.kv_page_size
-            requests = (
-                torch.arange(q.shape[0], device=q.device, dtype=torch.int32)
-                // q_len_per_req
+            index_metadata = ctx.attn_backend.require_dcp_indexer_metadata()
+            index_plan = index_metadata.prepare(
+                page_table,
+                seq_lens,
+                placement=placement,
+                page_size=page_size,
+                q_len_per_req=q_len_per_req,
+                max_logits_bytes=64 * 1024 * 1024,
             )
-            causal_lens = (
-                seq_lens[requests.long()]
-                - (q_len_per_req - 1)
-                + torch.arange(q.shape[0], device=q.device) % q_len_per_req
-            )
+            requests = index_plan.query_requests
             offsets, counts = select_dsa_topk(
                 q,
                 weights,
                 index_k_cache,
                 page_table,
                 requests,
-                causal_lens,
+                index_plan.causal_lens,
                 placement=placement,
                 page_size=page_size,
                 topk=topk,
@@ -609,6 +610,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 initial_tokens=0,
                 local_tokens=0,
                 max_logits_bytes=64 * 1024 * 1024,
+                metadata=index_plan,
             )
             pages = page_table[
                 requests.long().unsqueeze(1), offsets.clamp_min(0).long() // page_size

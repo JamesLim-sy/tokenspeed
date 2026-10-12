@@ -1068,6 +1068,11 @@ class CacheGroupRouter(AttentionBackend):
             layer_id, token_to_kv_pool, group
         )
 
+    def require_dcp_indexer_metadata(self):
+        return self._sole_leaf(
+            "require_dcp_indexer_metadata"
+        ).require_dcp_indexer_metadata()
+
     # ------------------------------------------------------------------
     # DSA KPool surface (GLM-5.3-Flash): the model drives the leaf's pooled
     # indexing runtime through the router.

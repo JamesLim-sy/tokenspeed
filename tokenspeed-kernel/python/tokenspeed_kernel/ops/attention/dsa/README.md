@@ -24,6 +24,29 @@ the online softmax; unused entries remain `-1`.
 Portable Triton implementations remain the fallback for trait combinations
 without a matching native registration.
 
+## DCP local candidate selection
+
+`deep_gemm_dsa_index_candidates` scores compact owned Index-K pages. On
+Hopper, its local top-k uses the in-tree CuTe DSL DeepSelect selector with
+the original compact lengths, so selection excludes the unused logits
+tail. Empty shards keep length zero for selection even though DeepGEMM's
+scoring scheduler needs a nonzero dummy length.
+
+This selector serves `topk <= 2048` on CUDA FP32 matrices with unit column
+stride, a 16-byte aligned base, and rows padded to four elements. Aligned
+non-contiguous rows need no copy. Other architectures, unsupported layouts
+or top-k sizes, and installations without CuTe DSL retain the existing
+`torch.topk` selection. The first eager call compiles every cluster variant
+of its survivor capacity before CUDA-graph capture; later batch shapes use
+those compiled variants.
+
+Scoring, logits capacity, the full-width mask, and candidate gathering are
+unchanged. The mask preserves mandatory global windows as `+inf`; do not
+apply the ordinary decode non-finite cleanup after those markings. Selected
+offsets are mapped back to global logical positions before DCP exchange.
+Tie order remains unspecified, and gathering drops candidates scoring
+`-inf`. This change does not alter attention-core selection or cache ownership.
+
 ## Index-K plane formats
 
 `dsa_prefill_topk` and `dsa_decode_topk` read the storage of the index-key
@@ -168,3 +191,21 @@ offsets, masking padding and handling partial tails and empty shards. Query
 quantization and head padding match the unsharded path; portable Triton provides
 the same interface. Query tiling bounds scratch memory, and fixed-shape GPU
 metadata supports CUDA graph replay without host reads.
+
+
+The optional `DSAIndexMetadata` argument shares a query tile's planning across
+layers of one forward. Construct it from the same local page table, contiguous
+request IDs, contiguous causal lengths and page size passed to
+`dsa_index_candidates`. DeepGEMM reuses compact pages, global logical positions,
+true local lengths, dummy nonzero scheduler lengths and its scheduler plan;
+Triton reuses sanitized request IDs and causal lengths. Each call still scores
+its own queries, weights and Index-K values.
+
+The caller replaces the metadata after every input refresh, including changes
+in place. Different views or selected kernels cannot reuse the same state.
+Prepare fresh metadata before capture: first use records preparation kernels
+once and graph replay recomputes them from the captured inputs. Kernels must
+advertise `index_candidate_metadata` to receive the optional argument; selection
+never silently discards supplied metadata. Omitting it retains per-call planning.
+Retained planning storage grows with total query rows times page-table columns;
+runtime enables cross-layer reuse for decode, leaving prefill tile-local.

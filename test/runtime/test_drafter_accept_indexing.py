@@ -308,6 +308,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
 
         k, bs = 4, 2
         backend = dsa_mod.DSABackend.__new__(dsa_mod.DSABackend)
+        backend.dcp_group = (0,)
         backend.spec_num_tokens = k
         backend.kernel_page_size = 64
         seq_lens_k = torch.tensor([9, 5], dtype=torch.int32)
@@ -356,6 +357,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_mod
 
         backend = dsa_mod.DSABackend.__new__(dsa_mod.DSABackend)
+        backend.dcp_group = (0,)
         backend.spec_num_tokens = 4
         backend.kernel_page_size = 64
         metadata = SimpleNamespace(
@@ -398,6 +400,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
 
         k, bs = 4, 2
         backend = dsa_mod.DSABackend.__new__(dsa_mod.DSABackend)
+        backend.dcp_group = (0,)
         backend.spec_num_tokens = k
         backend.kernel_page_size = 64
         metadata = TRTLLMMLADecodeMetadata(

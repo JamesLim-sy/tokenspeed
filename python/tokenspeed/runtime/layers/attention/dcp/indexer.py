@@ -20,14 +20,119 @@
 
 """Distributed sparse selection over sharded Index-K storage."""
 
+from dataclasses import dataclass
+
 import torch
-from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
+from tokenspeed_kernel.ops.attention.dsa import DSAIndexMetadata, dsa_index_candidates
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     resolve_cache_slots,
 )
+
+
+def _same_view(left: torch.Tensor, right: torch.Tensor) -> bool:
+    return (
+        left.shape == right.shape
+        and left.stride() == right.stride()
+        and left.dtype == right.dtype
+        and left.device == right.device
+        and left.data_ptr() == right.data_ptr()
+    )
+
+
+@dataclass(frozen=True)
+class DCPIndexPlan:
+    """Layer-invariant query and page mappings for one decode forward."""
+
+    page_table: torch.Tensor
+    seq_lens: torch.Tensor
+    placement: CachePlacement
+    page_size: int
+    q_len_per_req: int
+    max_logits_bytes: int
+    local_page_table: torch.Tensor
+    query_requests: torch.Tensor
+    causal_lens: torch.Tensor
+    tiles: tuple[DSAIndexMetadata, ...]
+
+
+@dataclass
+class DCPIndexerMetadata:
+    """Per-forward memoization owned by one cache group's DSA backend.
+
+    Replace this object on every metadata refresh. Input values must remain
+    unchanged across layers of that forward, even when their storage is reused
+    on the next step. Preparation is recorded once during graph capture and
+    executes again on replay from the refreshed input buffers.
+    """
+
+    plan: DCPIndexPlan | None = None
+
+    def prepare(
+        self,
+        page_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        placement: CachePlacement,
+        page_size: int,
+        q_len_per_req: int,
+        max_logits_bytes: int,
+    ) -> DCPIndexPlan:
+        """Prepare query rows, ownership translation and per-tile cache holders."""
+        if self.plan is not None:
+            plan = self.plan
+            if (
+                not _same_view(plan.page_table, page_table)
+                or not _same_view(plan.seq_lens, seq_lens)
+                or plan.placement != placement
+                or plan.page_size != page_size
+                or plan.q_len_per_req != q_len_per_req
+                or plan.max_logits_bytes != max_logits_bytes
+            ):
+                raise ValueError("DCP index inputs changed without a metadata refresh")
+            return plan
+        if (
+            page_table.ndim != 2
+            or seq_lens.ndim != 1
+            or page_table.shape[0] != seq_lens.numel()
+            or page_table.shape[1] == 0
+            or page_size <= 0
+            or q_len_per_req <= 0
+        ):
+            raise ValueError("Invalid DCP decode index metadata geometry")
+        rows = seq_lens.numel() * q_len_per_req
+        row_ids = torch.arange(rows, device=seq_lens.device, dtype=torch.int32)
+        requests = row_ids // q_len_per_req
+        causal_lens = (
+            seq_lens[requests.long()] - (q_len_per_req - 1) + row_ids % q_len_per_req
+        ).contiguous()
+        slots, owned = resolve_cache_slots(page_table.long() * page_size, placement)
+        local_table = torch.where(owned, slots // page_size, -1).to(torch.int32)
+        tile_rows = max(1, max_logits_bytes // (page_table.shape[1] * page_size * 4))
+        tiles = tuple(
+            DSAIndexMetadata(
+                local_table,
+                requests[start : start + tile_rows],
+                causal_lens[start : start + tile_rows],
+                page_size,
+            )
+            for start in range(0, rows, tile_rows)
+        )
+        self.plan = DCPIndexPlan(
+            page_table,
+            seq_lens,
+            placement,
+            page_size,
+            q_len_per_req,
+            max_logits_bytes,
+            local_table,
+            requests,
+            causal_lens,
+            tiles,
+        )
+        return self.plan
 
 
 def merge_index_candidates(
@@ -73,20 +178,36 @@ def select_dsa_topk(
     initial_tokens: int,
     local_tokens: int,
     max_logits_bytes: int,
+    metadata: DCPIndexPlan | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return request-relative global Top-K from local Index-K pages.
 
     Metadata has global positions throughout. Only cache addresses are local;
     global Top-K precedes the attention-side ownership mask and LSE reduction.
     Query tiling caps temporary logits for both prefill and decode.
+    ``metadata`` optionally supplies the decode forward's prepared mappings;
+    the input views, ownership and tiling must match the prepared plan.
     """
     if q.shape[0] == 0:
         return (
             torch.empty((0, topk), device=q.device, dtype=torch.int32),
             torch.empty(0, device=q.device, dtype=torch.int32),
         )
-    slots, owned = resolve_cache_slots(page_table.long() * page_size, placement)
-    local_table = torch.where(owned, slots // page_size, -1).to(torch.int32)
+    if metadata is None:
+        slots, owned = resolve_cache_slots(page_table.long() * page_size, placement)
+        local_table = torch.where(owned, slots // page_size, -1).to(torch.int32)
+    else:
+        if (
+            not _same_view(metadata.page_table, page_table)
+            or not _same_view(metadata.query_requests, query_requests)
+            or not _same_view(metadata.causal_lens, causal_lens)
+            or q.shape[0] != metadata.query_requests.numel()
+            or metadata.placement != placement
+            or metadata.page_size != page_size
+            or metadata.max_logits_bytes != max_logits_bytes
+        ):
+            raise ValueError("DCP selection inputs do not match the prepared plan")
+        local_table = metadata.local_page_table
     columns = page_table.shape[1]
     tile = max(1, max_logits_bytes // (columns * page_size * 4))
     outputs, lengths = [], []
@@ -105,6 +226,7 @@ def select_dsa_topk(
             initial_tokens=initial_tokens,
             local_tokens=local_tokens,
             solution=None,
+            metadata=None if metadata is None else metadata.tiles[start // tile],
         )
         indices, lens = merge_index_candidates(
             offsets, scores, topk=topk, group=placement.group

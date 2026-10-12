@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import functools
 import os
+from dataclasses import dataclass
 
 import torch
 
@@ -9,6 +11,13 @@ import torch
 from tokenspeed_kernel.ops.attention.dsa import (
     CANDIDATE_LENS_CPU_FEATURE,
     INDEX_K_WORKSPACE_ROWS_FEATURE,
+)
+from tokenspeed_kernel.ops.attention.dsa._index_metadata import (
+    INDEX_METADATA_FEATURE,
+    DSAIndexMetadata,
+)
+from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
+    candidate_topk_offsets,
 )
 from tokenspeed_kernel.ops.attention.dsa.cuda import (
     has_ragged_decode_topk,
@@ -40,6 +49,26 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 platform = current_platform()
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _DeepGemmIndexMetadata:
+    pages: torch.Tensor
+    positions: torch.Tensor
+    lengths: torch.Tensor
+    scoring_lengths: torch.Tensor
+    plan: torch.Tensor
+    num_sms: int
+
+
+_dcp_deep_select = None
+if platform.is_hopper:
+    try:
+        from tokenspeed_kernel.ops.attention.dsa._cute_dsl import (
+            deep_select as _dcp_deep_select,
+        )
+    except ImportError:
+        pass
 
 # Default the DSA decode top-k to the CuTe DSL cluster kernel; set
 # ``TS_DSA_DECODE_TOPK_CUTEDSL=0`` to fall back to the ragged/persistent path.
@@ -129,6 +158,62 @@ def _pad_index_heads(
     padded_q[:, :16].copy_(q)
     padded_weights[:, :16].copy_(weights)
     return padded_q, padded_weights
+
+
+@functools.cache
+def _warmup_dcp_topk(capacity: int, device: torch.device) -> None:
+    # Batch geometry can choose a different cluster during capture. Compile all
+    # variants of this capacity on the first eager call, as the V4.1 indexer does.
+    _dcp_deep_select.warmup((capacity,), device)
+
+
+def _dcp_candidate_topk_offsets(
+    scores: torch.Tensor, lengths: torch.Tensor, topk: int
+) -> torch.Tensor:
+    """Select compact local candidates, retaining torch for unsupported layouts.
+
+    ``scores`` has already been masked, including mandatory +inf windows.
+    ``lengths`` contains the original compact lengths, including empty rows,
+    rather than the nonzero dummy lengths used by DeepGEMM's scheduler.
+    """
+    selector = _dcp_deep_select
+    if (
+        selector is None
+        or not 1 <= topk <= selector.MAX_TOPK
+        or scores.dtype != torch.float32
+        or not scores.is_cuda
+        or scores.ndim != 2
+    ):
+        return candidate_topk_offsets(scores, topk)
+
+    rows, width = scores.shape
+    alignment = selector.SCORE_ALIGNMENT
+    padded_width = (width + alignment - 1) // alignment * alignment
+    storage_end = scores.storage_offset() + (rows - 1) * scores.stride(0) + padded_width
+    if (
+        rows == 0
+        or width == 0
+        or scores.stride(1) != 1
+        or scores.stride(0) < padded_width
+        or scores.stride(0) % alignment
+        or scores.data_ptr() % (alignment * scores.element_size())
+        or storage_end * scores.element_size() > scores.untyped_storage().nbytes()
+    ):
+        return candidate_topk_offsets(scores, topk)
+
+    capacity = selector.capacity_for(topk)
+    _warmup_dcp_topk(capacity, scores.device)
+    cluster_size = selector.choose_cluster_size(
+        rows, width, capacity, platform.sm_count
+    )
+    offsets, _ = selector.deepselect_topk(
+        scores,
+        lengths.reshape(-1),
+        topk,
+        capacity=capacity,
+        cluster_size=cluster_size,
+    )
+    return offsets
 
 
 def _check_out(
@@ -617,6 +702,7 @@ if platform.is_hopper_plus:
         name="deep_gemm_dsa_index_candidates",
         solution="deep_gemm",
         priority=Priority.PERFORMANT,
+        features=frozenset({INDEX_METADATA_FEATURE}),
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0), vendors=frozenset({"nvidia"})
         ),
@@ -649,20 +735,36 @@ if platform.is_hopper_plus:
         softmax_scale: float,
         initial_tokens: int,
         local_tokens: int,
+        metadata: DSAIndexMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
-            candidate_topk_offsets,
             compact_index_pages,
             gather_index_candidates,
             mask_index_scores,
         )
 
-        pages, positions, lengths = compact_index_pages(
-            local_page_table,
-            query_requests,
-            causal_lens,
-            page_size,
-        )
+        if deep_gemm.get_pdl() != pdl_enabled():
+            deep_gemm.set_pdl(pdl_enabled())
+        num_sms = deep_gemm.get_num_sms()
+        prepared = None if metadata is None else metadata.state
+        if prepared is not None and not isinstance(prepared, _DeepGemmIndexMetadata):
+            raise TypeError("Invalid DeepGEMM index metadata state")
+        if prepared is None or prepared.num_sms != num_sms:
+            pages, positions, lengths = compact_index_pages(
+                local_page_table, query_requests, causal_lens, page_size
+            )
+            # Empty rows still need dummy scheduler work on the reserved null
+            # page. Selection and masking keep the original zero lengths.
+            scoring_lengths = lengths.clamp_min(1)
+            plan = deep_gemm.get_paged_mqa_logits_metadata(
+                scoring_lengths, page_size, num_sms
+            )
+            prepared = _DeepGemmIndexMetadata(
+                pages, positions, lengths, scoring_lengths, plan, num_sms
+            )
+            if metadata is not None:
+                metadata.state = prepared
+        pages, positions, lengths = prepared.pages, prepared.positions, prepared.lengths
         q, weights = _pad_index_heads(q.contiguous(), weights)
         q_fp8, scale = quantize_fp8(
             q.reshape(-1, q.shape[-1]),
@@ -672,22 +774,13 @@ if platform.is_hopper_plus:
         )
         scale = scale[: q.shape[0] * q.shape[1]].contiguous()
         weights = combine_topk_weights(weights, scale, softmax_scale)
-        if deep_gemm.get_pdl() != pdl_enabled():
-            deep_gemm.set_pdl(pdl_enabled())
-        # DeepGEMM's scheduler requires nonempty work even when this rank
-        # owns no rows. Read the reserved null page for empty rows, then mask
-        # every dummy score using the original (zero) lengths below.
-        scoring_lengths = lengths.clamp_min(1)
-        plan = deep_gemm.get_paged_mqa_logits_metadata(
-            scoring_lengths, page_size, deep_gemm.get_num_sms()
-        )
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_fp8.view(q.shape[0], 1, q.shape[1], q.shape[2]),
             index_k_cache.view(-1, page_size, 1, index_k_cache.shape[-1]),
             weights,
-            scoring_lengths,
+            prepared.scoring_lengths,
             pages,
-            plan,
+            prepared.plan,
             pages.shape[1] * page_size,
             clean_logits=False,
         )
@@ -700,5 +793,5 @@ if platform.is_hopper_plus:
             initial_tokens,
             local_tokens,
         )
-        offsets = candidate_topk_offsets(logits, topk)
+        offsets = _dcp_candidate_topk_offsets(logits, lengths, topk)
         return gather_index_candidates(offsets, logits, positions, page_size)

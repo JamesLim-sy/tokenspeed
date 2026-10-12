@@ -69,6 +69,31 @@ can never see a silently-defaulted one. This is deliberate — a `= False`
 default once hid `extend_with_prefix` being swallowed by a composite's
 `**kwargs`, and FlashMLA planned a ragged prefill for a prefix-cached batch.
 
+### DCP indexer planning across layers
+
+Each DSA leaf owns a per-forward `DCPIndexerMetadata` memo for decode index
+planning. It translates virtual kernel pages with the cache group's scheduler
+block geometry and constructs each query row's causal endpoint once. Each query
+tile then reuses its selected kernel's derived state: DeepGEMM's compact pages,
+logical positions, local lengths and scheduler plan, or Triton's sanitized
+request rows. Queries, weights, Index-K values, logits and candidates remain
+layer-specific. Prefill retains tile-local preparation to avoid retaining all
+of a long prompt's expanded metadata across layers.
+
+The memo lives on the leaf, outside its pointer-stable decode-metadata slots,
+like other per-forward memos. Decode refresh, mixed initialization and draft
+length updates replace it; extend initialization and cache-pool rebinding clear
+it. It owns no request lifecycle state. The model obtains it through the DSA
+router accessor, under the same single-group contract as its decode metadata.
+
+Eager and capture use the same first-layer preparation. The runner refreshes
+before capture as it does before eager execution, so warmup state is discarded.
+Capture records the preparation kernels once, before all consuming layers;
+replay runs those kernels from the refreshed persistent page-table and length
+buffers. Replacing the Python memo before replay does not move graph inputs.
+Input views and ownership geometry must agree across users of one memo, and
+changing their contents requires a new forward's memo even if addresses match.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,

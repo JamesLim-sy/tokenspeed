@@ -970,3 +970,128 @@ def test_gather_index_candidates_matches_tensor_reference(device):
     torch.testing.assert_close(
         scores, torch.where(valid, expected_scores, -float("inf"))
     )
+
+
+@pytest.mark.parametrize("solution", ["deep_gemm", "triton"])
+def test_index_candidate_metadata_reuse_and_graph_refresh(
+    device, solution, monkeypatch
+):
+    from unittest import mock
+
+    from tokenspeed_kernel.ops.attention.dsa import (
+        DSAIndexMetadata,
+        deep_gemm,
+        dsa_index_candidates,
+    )
+    from tokenspeed_kernel.ops.attention.dsa._triton import index_candidates
+    from tokenspeed_kernel.platform import current_platform
+
+    if solution == "deep_gemm" and not current_platform().is_hopper_plus:
+        pytest.skip("DeepGEMM requires Hopper or newer")
+    torch.manual_seed(832)
+    table = torch.tensor(
+        [[3, -1, 1, 2], [-1, -1, -1, -1]], dtype=torch.int32, device=device
+    )
+    requests = torch.tensor([0, 1, -1, 9, 0], dtype=torch.int32, device=device)
+    causal = torch.tensor([193, 80, 15, 15, 0], dtype=torch.int32, device=device)
+    queries = [
+        torch.randn(5, 16, 128, dtype=torch.bfloat16, device=device) for _ in range(2)
+    ]
+    weights = [torch.randn(5, 16, device=device) for _ in range(2)]
+    caches = [
+        _pack_index_k_cache(torch.randn(256, 128, device=device), 64)[0]
+        for _ in range(2)
+    ]
+
+    def run(layer, metadata):
+        return dsa_index_candidates(
+            queries[layer],
+            weights[layer],
+            caches[layer],
+            table,
+            requests,
+            causal,
+            page_size=64,
+            topk=512,
+            softmax_scale=0.1,
+            initial_tokens=4,
+            local_tokens=8,
+            solution=solution,
+            metadata=metadata,
+        )
+
+    def check(actual, expected):
+        # K exceeds the table width: compare every valid logical position,
+        # allowing different tie order in mandatory windows and padding.
+        for row in range(5):
+            av, ev = actual[0][row] >= 0, expected[0][row] >= 0
+            ai, ao = actual[0][row, av].sort()
+            ei, eo = expected[0][row, ev].sort()
+            torch.testing.assert_close(ai, ei, rtol=0, atol=0)
+            torch.testing.assert_close(
+                actual[1][row, av][ao], expected[1][row, ev][eo], rtol=2e-5, atol=2e-5
+            )
+            assert (actual[0][row, ~av] == -1).all()
+            assert torch.isneginf(actual[1][row, ~av]).all()
+
+    references = [run(layer, None) for layer in range(2)]
+    compact = mock.Mock(wraps=index_candidates.compact_index_pages)
+    monkeypatch.setattr(index_candidates, "compact_index_pages", compact)
+    if solution == "deep_gemm":
+        planner = mock.Mock(wraps=deep_gemm.deep_gemm.get_paged_mqa_logits_metadata)
+        monkeypatch.setattr(
+            deep_gemm.deep_gemm, "get_paged_mqa_logits_metadata", planner
+        )
+    metadata = DSAIndexMetadata(table, requests, causal, 64)
+    first, second = run(0, metadata), run(1, metadata)
+    check(first, references[0])
+    check(second, references[1])
+    assert not torch.equal(first[1], second[1])
+    if solution == "deep_gemm":
+        assert compact.call_count == 1
+        assert planner.call_count == 1
+        assert metadata.state.lengths.flatten().tolist() == [129, 0, 0, 0, 0]
+        assert metadata.state.scoring_lengths.flatten().tolist() == [129, 1, 1, 1, 1]
+    # A different input view cannot accidentally reuse an earlier tile's plan.
+    with pytest.raises(ValueError, match="inputs changed"):
+        metadata.validate(table.clone(), requests, causal, 64)
+    if current_platform().is_hopper_plus:
+        with pytest.raises(ValueError, match="different kernel"):
+            dsa_index_candidates(
+                queries[0],
+                weights[0],
+                caches[0],
+                table,
+                requests,
+                causal,
+                page_size=64,
+                topk=512,
+                softmax_scale=0.1,
+                initial_tokens=4,
+                local_tokens=8,
+                solution="triton" if solution == "deep_gemm" else "deep_gemm",
+                metadata=metadata,
+            )
+
+    def forward():
+        fresh = DSAIndexMetadata(table, requests, causal, 64)
+        return run(0, fresh), run(1, fresh)
+
+    forward()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = forward()
+    for pages, reqs, ends in (
+        ([[3, -1, 1, 2], [-1, -1, -1, -1]], [0, 1, -1, 9, 0], [193, 80, 15, 15, 0]),
+        ([[-1, -1, -1, -1], [-1, -1, -1, -1]], [0, 1, -1, 9, 0], [0, 0, 0, 0, 0]),
+        ([[2, 1, -1, 3], [1, 3, 2, -1]], [1, 0, 1, -1, 0], [171, 65, 9, 80, 256]),
+    ):
+        table.copy_(torch.tensor(pages, dtype=torch.int32, device=device))
+        requests.copy_(torch.tensor(reqs, dtype=torch.int32, device=device))
+        causal.copy_(torch.tensor(ends, dtype=torch.int32, device=device))
+        queries[0].neg_()
+        weights[1].mul_(0.5)
+        graph.replay()
+        for layer in range(2):
+            check(captured[layer], run(layer, None))
