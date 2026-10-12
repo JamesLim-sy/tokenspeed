@@ -811,7 +811,15 @@ def test_global_index_candidate_merge_ties_and_empty_shards(monkeypatch, degree,
     ]
 
     def gather(x, group, dim):
-        return torch.cat(all_offsets if x.dtype == torch.int32 else all_scores, dim=dim)
+        assert x.dtype == torch.int32
+        assert x.shape == (offsets.shape[0], offsets.shape[1] * 2)
+        return torch.cat(
+            [
+                torch.stack((ids, values.view(torch.int32)), dim=-1).flatten(1)
+                for ids, values in zip(all_offsets, all_scores)
+            ],
+            dim=dim,
+        )
 
     monkeypatch.setattr(indexer, "all_gather", gather)
     selected, counts = indexer.merge_index_candidates(

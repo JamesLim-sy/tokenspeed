@@ -94,6 +94,21 @@ buffers. Replacing the Python memo before replay does not move graph inputs.
 Input views and ownership geometry must agree across users of one memo, and
 changing their contents requires a new forward's memo even if addresses match.
 
+### DCP candidate exchange
+
+Each query tile exchanges its local candidates through the ordinary communication
+backend in both eager and graph execution. The indexer produces int32 global
+logical positions and FP32 scores. Pack these into interleaved int32 records,
+preserving score bits, and issue one all-gather. An empty shard still contributes
+its fixed-capacity padding records. The receiving view preserves source-rank and
+candidate order for the existing global top-k and validity filtering.
+
+Packing reduces collective calls from two to one, while retaining eight payload
+bytes per candidate. The pack and the backend's row-layout conversion remain
+part of the cost; this contract does not imply fewer transmitted bytes. Other
+input dtypes retain the existing separate exchanges. A singleton group requires
+no exchange.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,

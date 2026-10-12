@@ -145,6 +145,8 @@ def merge_index_candidates(
     """Merge disjoint local candidates with one global Top-K selection.
 
     Communicates only K candidate positions and scores per query and rank.
+    Int32 positions and FP32 scores share one all-gather as interleaved int32
+    records; scores are reinterpreted bitwise, including mandatory +inf.
     Returns global logical positions and valid counts, identical on every rank.
     Positive infinity marks mandatory candidates; negative infinity is padding.
     Equal-score candidates have no prescribed logical-position order.
@@ -152,8 +154,20 @@ def merge_index_candidates(
     if offsets.shape != scores.shape or offsets.ndim != 2 or topk <= 0:
         raise ValueError("Candidate offsets/scores must be matching matrices")
     if len(group) > 1:
-        offsets = all_gather(offsets.contiguous(), group, dim=-1)
-        scores = all_gather(scores.contiguous(), group, dim=-1)
+        if offsets.dtype == torch.int32 and scores.dtype == torch.float32:
+            # Numeric conversion would lose large positions or score bits.
+            # Stack also packs strided producer views into contiguous records.
+            packed = torch.stack((offsets, scores.view(torch.int32)), dim=-1)
+            gathered = all_gather(packed.flatten(1), group, dim=-1)
+            candidates = gathered.reshape(
+                offsets.shape[0], offsets.shape[1] * len(group), 2
+            )
+            offsets = candidates[..., 0]
+            scores = candidates[..., 1].view(torch.float32)
+        else:
+            # Keep the existing input domain for callers using other dtypes.
+            offsets = all_gather(offsets.contiguous(), group, dim=-1)
+            scores = all_gather(scores.contiguous(), group, dim=-1)
     valid = (offsets >= 0) & ~torch.isnan(scores) & (scores > -float("inf"))
     scores = torch.where(valid, scores, -float("inf"))
     selected_scores, order = torch.topk(scores, topk, dim=-1)
