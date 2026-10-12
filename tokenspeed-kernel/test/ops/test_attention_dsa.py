@@ -1085,8 +1085,9 @@ def test_gather_index_candidates_matches_tensor_reference(device):
 
 
 @pytest.mark.parametrize("solution", ["deep_gemm", "triton"])
+@pytest.mark.parametrize("strided", [False, True])
 def test_index_candidate_metadata_reuse_and_graph_refresh(
-    device, solution, monkeypatch
+    device, solution, strided, monkeypatch
 ):
     from unittest import mock
 
@@ -1106,6 +1107,9 @@ def test_index_candidate_metadata_reuse_and_graph_refresh(
     )
     requests = torch.tensor([0, 1, -1, 9, 0], dtype=torch.int32, device=device)
     causal = torch.tensor([193, 80, 15, 15, 0], dtype=torch.int32, device=device)
+    if strided:
+        requests = requests.repeat_interleave(2)[::2]
+        causal = causal.repeat_interleave(2)[::2]
     queries = [
         torch.randn(5, 16, 128, dtype=torch.bfloat16, device=device) for _ in range(2)
     ]

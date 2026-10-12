@@ -28,6 +28,100 @@ from tokenspeed.runtime.layers.attention.dcp import indexer
 from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 
 
+@pytest.mark.parametrize("use_metadata", [False, True])
+@pytest.mark.parametrize(
+    "budget,tile_sizes",
+    [(1, [1, 1, 1]), (511, [1, 1, 1]), (1024, [2, 1]), (1536, [3])],
+)
+def test_query_tiling_budget_matches_planning_and_selection(
+    budget, tile_sizes, use_metadata, monkeypatch
+):
+    table = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
+    lengths = torch.full((3,), 128, dtype=torch.int32)
+    placement = CachePlacement(64, 7, (0,), 0)
+    plan = (
+        indexer.DCPIndexerMetadata().prepare(
+            table,
+            lengths,
+            placement=placement,
+            page_size=64,
+            q_len_per_req=1,
+            max_logits_bytes=budget,
+        )
+        if use_metadata
+        else None
+    )
+    requests = (
+        torch.arange(3, dtype=torch.int32) if plan is None else plan.query_requests
+    )
+    causal = lengths if plan is None else plan.causal_lens
+    seen = []
+
+    def candidates(q, weights, cache, local_table, reqs, ends, **kwargs):
+        seen.append(reqs.tolist())
+        if plan is not None:
+            assert kwargs["metadata"] is plan.tiles[len(seen) - 1]
+        return (
+            torch.tensor([[0, 1]], dtype=torch.int32).expand(q.shape[0], -1),
+            torch.tensor([[2.0, 1.0]]).expand(q.shape[0], -1),
+        )
+
+    monkeypatch.setattr(indexer, "dsa_index_candidates", candidates)
+    positions, counts = indexer.select_dsa_topk(
+        torch.zeros(3, 16, 128),
+        torch.zeros(3, 16),
+        torch.empty(7 * 64, 132, dtype=torch.uint8),
+        table,
+        requests,
+        causal,
+        placement=placement,
+        page_size=64,
+        topk=2,
+        softmax_scale=0.1,
+        initial_tokens=0,
+        local_tokens=0,
+        max_logits_bytes=budget,
+        metadata=plan,
+    )
+    assert [len(rows) for rows in seen] == tile_sizes
+    assert [request for rows in seen for request in rows] == [0, 1, 2]
+    assert positions.tolist() == [[0, 1]] * 3
+    assert counts.tolist() == [2] * 3
+
+
+@pytest.mark.parametrize("budget", [0, -1])
+def test_nonpositive_logits_budget_is_rejected(budget):
+    table = torch.tensor([[1]], dtype=torch.int32)
+    lengths = torch.tensor([1], dtype=torch.int32)
+    placement = CachePlacement(64, 2, (0,), 0)
+    with pytest.raises(ValueError, match="positive.*logits budget"):
+        indexer.DCPIndexerMetadata().prepare(
+            table,
+            lengths,
+            placement=placement,
+            page_size=64,
+            q_len_per_req=1,
+            max_logits_bytes=budget,
+        )
+    with pytest.raises(ValueError, match="positive.*logits budget"):
+        indexer.select_dsa_topk(
+            torch.empty(0, 16, 128),
+            torch.empty(0, 16),
+            torch.empty(0, 132, dtype=torch.uint8),
+            table,
+            torch.empty(0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.int32),
+            placement=placement,
+            page_size=64,
+            topk=2,
+            softmax_scale=0.1,
+            initial_tokens=0,
+            local_tokens=0,
+            max_logits_bytes=budget,
+            metadata=None,
+        )
+
+
 @pytest.mark.parametrize("degree", [2, 4])
 @pytest.mark.parametrize("block_size", [64, 128])
 @pytest.mark.parametrize("query_width", [1, 3])
@@ -220,13 +314,22 @@ def test_extend_metadata_clears_old_decode_memo(mixed, monkeypatch):
         assert backend._dcp_indexer is None
 
 
-def test_model_reuses_plan_but_maps_each_layers_candidates(monkeypatch):
+@pytest.mark.parametrize(
+    "batch,columns,tile_sizes", [(2, 2, [2]), (64, 4096, [64]), (65, 4096, [64, 1])]
+)
+def test_model_reuses_plan_but_maps_each_layers_candidates(
+    batch, columns, tile_sizes, monkeypatch
+):
     from tokenspeed.runtime.models import glm5
 
     memo = indexer.DCPIndexerMetadata()
     placement = CachePlacement(64, 9, (0,), 0)
-    table = torch.tensor([[5, 2], [7, 1]], dtype=torch.int32)
-    lengths = torch.tensor([70, 81], dtype=torch.int32)
+    # Cover the 64 MiB decode tiling boundary without allocating large logits.
+    table = torch.zeros(batch, columns, dtype=torch.int32)
+    table[:, :2] = torch.tensor([7, 1], dtype=torch.int32)
+    table[0, :2] = torch.tensor([5, 2], dtype=torch.int32)
+    lengths = torch.full((batch,), 81, dtype=torch.int32)
+    lengths[0] = 70
     cache = torch.empty((8 * 64, 132), dtype=torch.uint8)
     ctx = SimpleNamespace(
         num_extends=1,
@@ -253,13 +356,15 @@ def test_model_reuses_plan_but_maps_each_layers_candidates(monkeypatch):
         tile = kwargs["metadata"]
         tile.validate(local_table, requests, causal, 64)
         assert index_k is cache
-        assert causal.tolist() == [70, 81]
+        assert q.shape[0] == requests.numel()
+        assert causal.tolist() == lengths[requests.long()].tolist()
         seen.append(tile)
         # Different layers choose different positions; only the mappings reuse.
-        return (
-            torch.tensor([[len(seen) - 1, 64], [2, -1]], dtype=torch.int32),
-            torch.tensor([[3.0, 2.0], [1.0, -torch.inf]]),
-        )
+        offsets = torch.tensor([[2, -1]], dtype=torch.int32).repeat(q.shape[0], 1)
+        scores = torch.tensor([[1.0, -torch.inf]]).repeat(q.shape[0], 1)
+        offsets[requests == 0] = torch.tensor([iteration, 64], dtype=torch.int32)
+        scores[requests == 0] = torch.tensor([3.0, 2.0])
+        return offsets, scores
 
     monkeypatch.setattr(indexer, "dsa_index_candidates", candidates)
     with mock.patch.object(
@@ -268,31 +373,36 @@ def test_model_reuses_plan_but_maps_each_layers_candidates(monkeypatch):
         for iteration in range(2):
             result = layer._compute_decode_topk_indices_portable(
                 indexer_output=glm5.GlmDsaIndexerOutput(
-                    torch.zeros(3, 16, 128, dtype=torch.bfloat16),
+                    torch.zeros(batch + 1, 16, 128, dtype=torch.bfloat16),
                     torch.empty(0),
-                    torch.zeros(3, 16),
+                    torch.zeros(batch + 1, 16),
                 ),
                 ctx=ctx,
                 seq_lens=lengths[:],
                 page_table=table[:],
                 q_len_per_req=1,
                 decode_start=1,
-                num_tokens=3,
-                num_decode_tokens=2,
+                num_tokens=batch + 1,
+                num_decode_tokens=batch,
                 topk=2,
             )
             assert result.topk_indices.tolist() == [
                 [-1, -1],
                 [320 + iteration, 128],
-                [450, -1],
-            ]
-            assert result.topk_lens.tolist() == [0, 2, 1]
+            ] + [[450, -1]] * (batch - 1)
+            assert result.topk_lens.tolist() == [0, 2] + [1] * (batch - 1)
         assert translate.call_count == 1
-    assert seen[0] is seen[1]
+    assert memo.plan.max_logits_bytes == glm5._DCP_DECODE_LOGITS_BUDGET_BYTES
+    assert [tile.query_requests.numel() for tile in seen] == tile_sizes * 2
+    assert all(
+        first is second
+        for first, second in zip(seen[: len(tile_sizes)], seen[len(tile_sizes) :])
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_tiled_selection_reuses_metadata_through_runtime_and_graph():
+@pytest.mark.parametrize("budget,num_tiles", [(2048, 1), (512, 4)])
+def test_tiled_selection_reuses_metadata_through_runtime_and_graph(budget, num_tiles):
     from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
     from tokenspeed_kernel.ops.quantization import quantize_fp8
 
@@ -328,9 +438,9 @@ def test_tiled_selection_reuses_metadata_through_runtime_and_graph():
                 placement=placement,
                 page_size=64,
                 q_len_per_req=2,
-                max_logits_bytes=512,
+                max_logits_bytes=budget,
             )
-            assert len(plan.tiles) == 4
+            assert len(plan.tiles) == num_tiles
             outputs.append(
                 indexer.select_dsa_topk(
                     q,
@@ -345,7 +455,7 @@ def test_tiled_selection_reuses_metadata_through_runtime_and_graph():
                     softmax_scale=0.1,
                     initial_tokens=0,
                     local_tokens=0,
-                    max_logits_bytes=512,
+                    max_logits_bytes=budget,
                     metadata=plan,
                 )
             )

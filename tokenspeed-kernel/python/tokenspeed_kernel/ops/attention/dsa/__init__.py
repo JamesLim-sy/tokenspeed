@@ -682,10 +682,10 @@ def dsa_index_candidates(
         raise ValueError("Index candidate topk must be a positive power of two")
     if q.ndim != 3 or weights.shape != q.shape[:2]:
         raise ValueError("Index queries and per-head weights must match")
-    query_requests = query_requests.contiguous()
-    causal_lens = causal_lens.contiguous()
     if metadata is not None:
         metadata.validate(local_page_table, query_requests, causal_lens, page_size)
+    query_requests = query_requests.contiguous()
+    causal_lens = causal_lens.contiguous()
     if index_k_cache.dtype != torch.uint8:
         raise TypeError("DSA index candidates require packed FP8 Index-K storage")
     if initial_tokens < 0 or local_tokens < 0 or initial_tokens + local_tokens > topk:

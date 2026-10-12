@@ -69,6 +69,8 @@ from tokenspeed.runtime.utils import add_prefix, set_weight_attrs
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _INDEXER_PREFILL_MAX_LOGITS_MB_ARG = "deepseek_v4_indexer_prefill_max_logits_mb"
+# Preserve the decode tiling budget for logical FP32 logits, not total memory.
+_DCP_DECODE_LOGITS_BUDGET_BYTES = 64 * 1024**2
 
 
 @dataclass
@@ -593,7 +595,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 placement=placement,
                 page_size=page_size,
                 q_len_per_req=q_len_per_req,
-                max_logits_bytes=64 * 1024 * 1024,
+                max_logits_bytes=_DCP_DECODE_LOGITS_BUDGET_BYTES,
             )
             requests = index_plan.query_requests
             offsets, counts = select_dsa_topk(
@@ -609,7 +611,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 softmax_scale=self.indexer.weights_softmax_scale,
                 initial_tokens=0,
                 local_tokens=0,
-                max_logits_bytes=64 * 1024 * 1024,
+                max_logits_bytes=index_plan.max_logits_bytes,
                 metadata=index_plan,
             )
             pages = page_table[

@@ -42,6 +42,20 @@ def _same_view(left: torch.Tensor, right: torch.Tensor) -> bool:
     )
 
 
+def _query_tile_rows(columns: int, page_size: int, max_logits_bytes: int) -> int:
+    """Size query tiles by logical FP32 logits, allowing at least one row.
+
+    This is a tiling target, not a peak-memory cap: kernel row alignment,
+    selection scratch, candidate exchange and retained metadata are additional.
+    """
+    if columns <= 0 or page_size <= 0:
+        raise ValueError("Index tiling requires positive page geometry")
+    if max_logits_bytes <= 0:
+        raise ValueError("Index tiling requires a positive logits budget")
+    row_bytes = columns * page_size * torch.float32.itemsize
+    return max(1, max_logits_bytes // row_bytes)
+
+
 @dataclass(frozen=True)
 class DCPIndexPlan:
     """Layer-invariant query and page mappings for one decode forward."""
@@ -52,6 +66,7 @@ class DCPIndexPlan:
     page_size: int
     q_len_per_req: int
     max_logits_bytes: int
+    tile_rows: int
     local_page_table: torch.Tensor
     query_requests: torch.Tensor
     causal_lens: torch.Tensor
@@ -103,6 +118,7 @@ class DCPIndexerMetadata:
         ):
             raise ValueError("Invalid DCP decode index metadata geometry")
         rows = seq_lens.numel() * q_len_per_req
+        tile_rows = _query_tile_rows(page_table.shape[1], page_size, max_logits_bytes)
         row_ids = torch.arange(rows, device=seq_lens.device, dtype=torch.int32)
         requests = row_ids // q_len_per_req
         causal_lens = (
@@ -110,7 +126,6 @@ class DCPIndexerMetadata:
         ).contiguous()
         slots, owned = resolve_cache_slots(page_table.long() * page_size, placement)
         local_table = torch.where(owned, slots // page_size, -1).to(torch.int32)
-        tile_rows = max(1, max_logits_bytes // (page_table.shape[1] * page_size * 4))
         tiles = tuple(
             DSAIndexMetadata(
                 local_table,
@@ -121,16 +136,17 @@ class DCPIndexerMetadata:
             for start in range(0, rows, tile_rows)
         )
         self.plan = DCPIndexPlan(
-            page_table,
-            seq_lens,
-            placement,
-            page_size,
-            q_len_per_req,
-            max_logits_bytes,
-            local_table,
-            requests,
-            causal_lens,
-            tiles,
+            page_table=page_table,
+            seq_lens=seq_lens,
+            placement=placement,
+            page_size=page_size,
+            q_len_per_req=q_len_per_req,
+            max_logits_bytes=max_logits_bytes,
+            tile_rows=tile_rows,
+            local_page_table=local_table,
+            query_requests=requests,
+            causal_lens=causal_lens,
+            tiles=tiles,
         )
         return self.plan
 
@@ -160,10 +176,10 @@ def merge_index_candidates(
             packed = torch.stack((offsets, scores.view(torch.int32)), dim=-1)
             gathered = all_gather(packed.flatten(1), group, dim=-1)
             candidates = gathered.reshape(
-                offsets.shape[0], offsets.shape[1] * len(group), 2
+                offsets.shape[0], offsets.shape[1] * len(group), packed.shape[-1]
             )
-            offsets = candidates[..., 0]
-            scores = candidates[..., 1].view(torch.float32)
+            offsets, score_bits = candidates.unbind(dim=-1)
+            scores = score_bits.view(torch.float32)
         else:
             # Keep the existing input domain for callers using other dtypes.
             offsets = all_gather(offsets.contiguous(), group, dim=-1)
@@ -198,16 +214,21 @@ def select_dsa_topk(
 
     Metadata has global positions throughout. Only cache addresses are local;
     global Top-K precedes the attention-side ownership mask and LSE reduction.
-    Query tiling caps temporary logits for both prefill and decode.
+    ``max_logits_bytes`` is a positive target for logical FP32 logits per
+    query tile, with at least one row per tile. Kernel padding and other
+    temporary allocations can exceed this target; it is not a peak-memory cap.
     ``metadata`` optionally supplies the decode forward's prepared mappings;
     the input views, ownership and tiling must match the prepared plan.
     """
+    if max_logits_bytes <= 0:
+        raise ValueError("Index tiling requires a positive logits budget")
     if q.shape[0] == 0:
         return (
             torch.empty((0, topk), device=q.device, dtype=torch.int32),
             torch.empty(0, device=q.device, dtype=torch.int32),
         )
     if metadata is None:
+        tile = _query_tile_rows(page_table.shape[1], page_size, max_logits_bytes)
         slots, owned = resolve_cache_slots(page_table.long() * page_size, placement)
         local_table = torch.where(owned, slots // page_size, -1).to(torch.int32)
     else:
@@ -222,8 +243,7 @@ def select_dsa_topk(
         ):
             raise ValueError("DCP selection inputs do not match the prepared plan")
         local_table = metadata.local_page_table
-    columns = page_table.shape[1]
-    tile = max(1, max_logits_bytes // (columns * page_size * 4))
+        tile = metadata.tile_rows
     outputs, lengths = [], []
     for start in range(0, q.shape[0], tile):
         end = min(q.shape[0], start + tile)
