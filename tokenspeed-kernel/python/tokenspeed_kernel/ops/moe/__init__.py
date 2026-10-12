@@ -22,7 +22,6 @@ from typing import Any, Literal
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.moe.cuda  # noqa: F401
-import tokenspeed_kernel.ops.moe.cute_dsl  # noqa: F401
 import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401

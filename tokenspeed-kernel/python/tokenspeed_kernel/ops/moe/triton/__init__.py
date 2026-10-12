@@ -19,7 +19,6 @@
 # SOFTWARE.
 
 import tokenspeed_kernel.ops.moe.triton.bf16  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton.dispatch  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton.fp8  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton.inkling_topk  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton.latent_input  # noqa: F401
