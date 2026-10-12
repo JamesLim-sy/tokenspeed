@@ -25,9 +25,8 @@ on some rank. Routing then emits physical ids: every rank runs the same
 routing over the same tokens, so the replica must be a pure function of the
 token row and route rank -- ``replicas[logical, (row + rank) % count]`` --
 for exactly one rank to own each (token, expert) pair. ``dispatch_topk_ids``
-is the production implementation of that choice, in tensor ops (two gathers
-and a modulo over ``[tokens, top_k]``); a fused Triton kernel is a
-follow-up, see ``README.md``. Load counting is the runtime's
+is the production implementation of that choice, fused into one GPU launch.
+See ``README.md`` for backend selection. Load counting is the runtime's
 (``record_expert_load``), applied to the mapped ids after routing.
 """
 
@@ -36,6 +35,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,8 @@ class ExpertDispatch:
             raise ValueError("num_replicas must be int32 [num_logical]")
         if not (self.replicas.is_contiguous() and self.num_replicas.is_contiguous()):
             raise ValueError("dispatch tables must be contiguous")
+        if self.replicas.device != self.num_replicas.device:
+            raise ValueError("dispatch tables must be on the same device")
 
     @property
     def max_replicas(self) -> int:
@@ -72,21 +80,60 @@ def dispatch_topk_ids(topk_ids: torch.Tensor, dispatch: ExpertDispatch) -> torch
 
     Replica ``(row + route rank) % count`` of each logical expert, so every
     rank running the same routing over the same rows picks the same replica
-    and the replicas of a hot expert share its routes evenly. Tensor ops,
-    graph-capturable; the ids must all be real experts in ``[0, num_logical)``
+    and the replicas of a hot expert share its routes evenly. The GPU kernels
+    are graph-capturable; the ids must all be real experts in ``[0, num_logical)``
     (the runtime masks zero experts and padding around this call).
 
     Args:
         topk_ids: ``[tokens, top_k]`` logical ids, every entry in
             ``[0, num_logical)``.
-        dispatch: The layer's replica tables.
+        dispatch: The layer's replica tables, on the same device as the ids.
 
     Returns:
         ``[tokens, top_k]`` physical ids in ``topk_ids``' dtype.
     """
+    if topk_ids.ndim != 2:
+        raise ValueError("topk_ids must have shape [tokens, top_k]")
+    if topk_ids.device != dispatch.replicas.device:
+        raise ValueError("topk_ids and dispatch tables must be on the same device")
+    if not topk_ids.is_cuda or topk_ids.dtype not in (torch.int32, torch.int64):
+        return torch_dispatch_topk_ids(
+            topk_ids, dispatch.replicas, dispatch.num_replicas
+        )
+    kernel = select_kernel(
+        "moe",
+        "dispatch",
+        format_signature(topk_ids=dense_tensor_format(topk_ids.dtype)),
+    )
+    return kernel(topk_ids, dispatch.replicas, dispatch.num_replicas)
+
+
+@register_kernel(
+    "moe",
+    "dispatch",
+    name="torch_dispatch_topk_ids",
+    solution="torch",
+    signatures=format_signatures("topk_ids", "dense", {torch.int32, torch.int64}),
+    priority=Priority.REFERENCE,
+)
+def torch_dispatch_topk_ids(
+    topk_ids: torch.Tensor,
+    replicas: torch.Tensor,
+    num_replicas: torch.Tensor,
+) -> torch.Tensor:
+    """Reference implementation of the replica mapping.
+
+    Args:
+        topk_ids: Logical ids shaped [tokens, top_k].
+        replicas: Contiguous int32 [num_logical, max_replicas] physical ids.
+        num_replicas: Contiguous int32 [num_logical] valid replica counts.
+
+    Returns:
+        Physical ids with the input shape and dtype.
+    """
     rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)[:, None]
     ranks = torch.arange(topk_ids.shape[1], device=topk_ids.device)[None, :]
     logical = topk_ids.long()
-    count = dispatch.num_replicas.long()[logical]
-    physical = dispatch.replicas.long()[logical, (rows + ranks) % count]
+    count = num_replicas.long()[logical]
+    physical = replicas.long()[logical, (rows + ranks) % count]
     return physical.to(topk_ids.dtype)

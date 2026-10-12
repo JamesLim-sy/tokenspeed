@@ -35,14 +35,15 @@ def _dispatch() -> ExpertDispatch:
     )
 
 
-def test_replica_is_a_pure_function_of_row_and_route_rank():
+@pytest.mark.parametrize("dtype", [torch.int16, torch.int32, torch.int64])
+def test_replica_is_a_pure_function_of_row_and_route_rank(dtype):
     dispatch = _dispatch()
     assert dispatch.max_replicas == 3
-    ids = torch.tensor([[2, 0], [2, 0], [2, 1]], dtype=torch.int64)
+    ids = torch.tensor([[2, 0], [2, 0], [2, 1]], dtype=dtype)
     physical = dispatch_topk_ids(ids, dispatch)
     # Row r, route rank k picks replicas[logical, (r + k) % count].
     assert physical.tolist() == [[2, 3], [4, 0], [5, 1]]
-    assert physical.dtype == torch.int64
+    assert physical.dtype == dtype
     # Every rank running the same routing over the same rows agrees.
     assert torch.equal(physical, dispatch_topk_ids(ids, dispatch))
 
@@ -55,3 +56,15 @@ def test_dispatch_tables_are_validated():
         ExpertDispatch(good.replicas, good.num_replicas[:2])
     with pytest.raises(ValueError, match="contiguous"):
         ExpertDispatch(good.replicas.t().contiguous().t(), good.num_replicas)
+    with pytest.raises(ValueError, match="same device"):
+        ExpertDispatch(good.replicas, good.num_replicas.to("meta"))
+
+
+def test_dispatch_rejects_incompatible_ids():
+    dispatch = _dispatch()
+    with pytest.raises(ValueError, match="shape"):
+        dispatch_topk_ids(torch.tensor([0, 1]), dispatch)
+    with pytest.raises(ValueError, match="same device"):
+        dispatch_topk_ids(
+            torch.empty((1, 2), dtype=torch.int32, device="meta"), dispatch
+        )
