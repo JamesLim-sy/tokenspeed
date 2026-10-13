@@ -270,13 +270,6 @@ def _index_k_rows_kwargs(
     """
     if index_k_fp8 is None and index_k_bf16 is None:
         return {}
-    spec = KernelRegistry.get().get_by_name(kernel.name)
-    if spec is None or INDEX_K_WORKSPACE_ROWS_FEATURE not in spec.features:
-        raise ValueError(
-            f"DSA kernel {kernel.name!r} does not declare the "
-            f"{INDEX_K_WORKSPACE_ROWS_FEATURE!r} feature: it resolves index keys "
-            "from a plane and cannot score rows in workspace-row order"
-        )
     if index_k_bf16 is not None:
         return {"index_k_bf16": index_k_bf16}
     return {"index_k_fp8": index_k_fp8, "index_k_scale": index_k_scale}
@@ -448,10 +441,6 @@ def dsa_decode(
         Partials come back in the query dtype (each context shard is rounded
         before aggregation); only the LSE stays FP32 for the cross-shard merge.
     """
-    if slot_order not in SLOT_ORDERS:
-        raise ValueError(
-            f"slot_order must be one of {list(SLOT_ORDERS)}, got {slot_order!r}"
-        )
     if q.dim() == 4:
         batch_size, q_len, num_heads, head_dim = q.shape
         tokens = batch_size * q_len
@@ -577,10 +566,6 @@ def dsa_prefill(
     Returns:
         Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
     """
-    if slot_order not in SLOT_ORDERS:
-        raise ValueError(
-            f"slot_order must be one of {list(SLOT_ORDERS)}, got {slot_order!r}"
-        )
     if q.dim() == 4:
         batch_size, q_len, num_heads, head_dim = q.shape
         tokens = batch_size * q_len
@@ -675,11 +660,10 @@ def dsa_index_candidates(
     global token positions. Returns global logical offsets and FP32 scores;
     invalid candidates use (-1, -inf), mandatory candidates use +inf scores.
     ``solution=None`` selects the best supported kernel, or force a solution.
+    The caller validates that topk is a positive power of two during setup.
     ``metadata`` optionally reuses a tile's planning across layers of one
     forward; its bound input views must match this call. It never caches scores.
     """
-    if topk <= 0 or topk & (topk - 1):
-        raise ValueError("Index candidate topk must be a positive power of two")
     if q.ndim != 3 or weights.shape != q.shape[:2]:
         raise ValueError("Index queries and per-head weights must match")
     if metadata is not None:
@@ -911,13 +895,6 @@ def dsa_prefill_topk(
         )
     initial_tokens = int(initial_tokens)
     local_tokens = int(local_tokens)
-    if initial_tokens < 0 or local_tokens < 0:
-        raise ValueError("initial_tokens and local_tokens must be non-negative")
-    if initial_tokens + local_tokens > int(topk):
-        raise ValueError(
-            "initial_tokens + local_tokens must not exceed topk; got "
-            f"{initial_tokens} + {local_tokens} > {int(topk)}"
-        )
     required_features = set()
     if initial_tokens or local_tokens:
         required_features.add("forced_initial_local")
@@ -1127,13 +1104,6 @@ def dsa_decode_topk(
         traits.update(_index_k_plane_traits(index_k_cache, q.shape[-1]))
     initial_tokens = int(initial_tokens)
     local_tokens = int(local_tokens)
-    if initial_tokens < 0 or local_tokens < 0:
-        raise ValueError("initial_tokens and local_tokens must be non-negative")
-    if initial_tokens + local_tokens > int(topk):
-        raise ValueError(
-            "initial_tokens + local_tokens must not exceed topk; got "
-            f"{initial_tokens} + {local_tokens} > {int(topk)}"
-        )
     required_features = set()
     if topk_layout == "logical_offsets":
         required_features.add("logical_offsets")
