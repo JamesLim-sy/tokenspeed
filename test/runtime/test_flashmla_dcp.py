@@ -299,6 +299,14 @@ def test_no_sink_combine_preserves_contiguous_mla_output(monkeypatch, batch, dty
     monkeypatch.setattr(
         comm, "reduce_scatter", lambda x, group: (x * len(group))[:4].contiguous()
     )
+
+    def exchange(receive, send, group):
+        head_owner = send.reshape(2, batch, 4, -1)[0]
+        receive.view(2, batch, 4, -1).copy_(
+            head_owner.unsqueeze(0).expand(2, -1, -1, -1)
+        )
+
+    monkeypatch.setattr(comm, "all_to_all_single", exchange)
     merged = comm.combine_attention_partials(
         output, lse, group=(0, 1), rank=0, sink=None, keep_all_heads=False
     )

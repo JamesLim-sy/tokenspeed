@@ -31,7 +31,10 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode_topk,
     dsa_prefill_topk,
 )
-from tokenspeed_kernel.ops.attention.dsa.triton import workspace_topk_to_global_slots
+from tokenspeed_kernel.ops.attention.dsa.triton import (
+    local_topk_to_global_slots,
+    workspace_topk_to_global_slots,
+)
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -598,7 +601,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 max_logits_bytes=_DCP_DECODE_LOGITS_BUDGET_BYTES,
             )
             requests = index_plan.query_requests
-            offsets, counts = select_dsa_topk(
+            offsets, _ = select_dsa_topk(
                 q,
                 weights,
                 index_k_cache,
@@ -614,13 +617,16 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 max_logits_bytes=index_plan.max_logits_bytes,
                 metadata=index_plan,
             )
-            pages = page_table[
-                requests.long().unsqueeze(1), offsets.clamp_min(0).long() // page_size
-            ]
-            topk_slice.copy_(
-                torch.where(offsets >= 0, pages * page_size + offsets % page_size, -1)
+            local_topk_to_global_slots(
+                local_topk_offsets=offsets,
+                block_table=page_table,
+                block_size=page_size,
+                seq_lens=None,
+                q_len_per_req=q_len_per_req,
+                topk_layout="global_slots",
+                out=topk_slice,
+                lens_out=topk_lens_slice,
             )
-            topk_lens_slice.copy_(counts)
         else:
             dsa_decode_topk(
                 q,

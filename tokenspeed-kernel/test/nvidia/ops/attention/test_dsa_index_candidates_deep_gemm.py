@@ -23,10 +23,6 @@
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.dsa import deep_gemm, dsa_index_candidates
-from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
-    gather_index_candidates,
-    mask_index_scores,
-)
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -82,11 +78,16 @@ def _metadata(width, lengths):
 
 
 def _select_candidates(scores, positions, lengths, causal, topk):
-    mask_index_scores(
-        scores, positions, lengths, causal, PAGE_SIZE, INITIAL_TOKENS, LOCAL_TOKENS
+    return deep_gemm._select_dcp_index_candidates(
+        scores,
+        positions,
+        lengths,
+        causal,
+        page_size=PAGE_SIZE,
+        topk=topk,
+        initial_tokens=INITIAL_TOKENS,
+        local_tokens=LOCAL_TOKENS,
     )
-    offsets = deep_gemm._dcp_candidate_topk_offsets(scores, lengths, topk)
-    return gather_index_candidates(offsets, scores, positions, PAGE_SIZE)
 
 
 def _check_candidates(raw, positions, lengths, causal, topk, logical, values):
@@ -158,8 +159,8 @@ def test_dcp_selector_graph_refresh_and_precompiled_clusters():
     # An eager short-row call must also prepare the larger cluster variants
     # that a subsequent batch can choose, without specializing on row geometry.
     small = torch.ones((1, 128), device="cuda")
-    small_lengths = torch.tensor([[128]], dtype=torch.int32, device="cuda")
-    deep_gemm._dcp_candidate_topk_offsets(small, small_lengths, 512)
+    small_positions, small_lengths, small_causal = _metadata(128, [128])
+    _select_candidates(small, small_positions, small_lengths, small_causal, 512)
     compiled = deep_select.compiled_selector.cache_info().misses
 
     width, topk = 65536, 512
@@ -214,12 +215,11 @@ def test_dcp_selector_retains_torch_fallback(unsupported, monkeypatch):
         pytest.fail("unsupported inputs must not compile or launch DeepSelect")
 
     monkeypatch.setattr(deep_gemm, "_warmup_dcp_topk", unexpected_warmup)
-    actual = deep_gemm._dcp_candidate_topk_offsets(scores, lengths, topk)
-    expected = torch.topk(scores, min(topk, scores.shape[1]), sorted=False).indices
-    expected = torch.nn.functional.pad(
-        expected, (0, topk - expected.shape[1]), value=-1
-    )
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert not deep_gemm._dcp_topk_supports_lengths(scores, topk)
+    raw = scores.clone()
+    positions, lengths, causal = _metadata(scores.shape[1], lengths.flatten().tolist())
+    logical, values = _select_candidates(scores, positions, lengths, causal, topk)
+    _check_candidates(raw, positions, lengths, causal, topk, logical, values)
 
 
 def test_deep_gemm_facade_selects_with_original_empty_lengths(monkeypatch):

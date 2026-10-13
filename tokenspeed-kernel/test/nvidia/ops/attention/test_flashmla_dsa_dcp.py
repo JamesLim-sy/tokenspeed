@@ -21,6 +21,10 @@
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode, dsa_prefill
+from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
+    combine_dcp_attention_partials,
+    dispatch_dcp_attention_partials,
+)
 from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()
@@ -60,7 +64,7 @@ def test_flashmla_dsa_dcp_partials(phase, q_len, degree):
     torch.manual_seed(17)
     latent = torch.randn((256, 512), device="cuda", dtype=torch.bfloat16)
     rope = torch.randn((256, 64), device="cuda", dtype=torch.bfloat16)
-    query = torch.randn((3, 4, 576), device="cuda", dtype=torch.bfloat16)
+    query = torch.randn((3, max(4, degree), 576), device="cuda", dtype=torch.bfloat16)
     dense = torch.cat((latent, rope), dim=-1)
     sparse, reference_latent = (
         _pack_sparse_kv(latent, rope) if packed else (None, latent)
@@ -125,6 +129,26 @@ def test_flashmla_dsa_dcp_partials(phase, q_len, degree):
     merged_lse = torch.logsumexp(lses, dim=0)
     weights = torch.where(torch.isfinite(lses), (lses - merged_lse).exp(), 0.0)
     merged = (torch.stack(outputs) * weights[..., None]).sum(0)
+    sent = [
+        dispatch_dcp_attention_partials(output.to(query.dtype), lse, degree=degree)
+        for output, lse in zip(outputs, lses)
+    ]
+    local_heads = query.shape[1] // degree
+    for owner in range(degree):
+        received = torch.stack([payload[owner] for payload in sent])
+        actual = combine_dcp_attention_partials(
+            received,
+            head_dim=512,
+            partial_dtype=query.dtype,
+            output_dtype=torch.float32,
+            sink=None,
+        )
+        torch.testing.assert_close(
+            actual,
+            merged[:, owner * local_heads : (owner + 1) * local_heads],
+            rtol=3e-6,
+            atol=2e-6,
+        )
     torch.testing.assert_close(merged, reference.float(), atol=0.015, rtol=0.015)
     torch.testing.assert_close(merged_lse, ref_lse, atol=2e-3, rtol=2e-3)
     assert not reference[2].any()

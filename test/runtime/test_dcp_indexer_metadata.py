@@ -128,15 +128,16 @@ def test_nonpositive_logits_budget_is_rejected(budget):
 def test_decode_plan_reuses_translation_and_preserves_geometry(
     degree, block_size, query_width
 ):
-    subpages = block_size // 64
+    page_size = 64
+    subpages = block_size // page_size
     blocks = torch.tensor([[3, 2, 5], [0, 10, 1]], dtype=torch.int32)
     table = (blocks[..., None] * subpages + torch.arange(subpages)).reshape(2, -1)
     seq_lens = torch.tensor([137, 3], dtype=torch.int32)
     kwargs = dict(
         placement=CachePlacement(block_size, 10, tuple(range(degree)), 0),
-        page_size=64,
+        page_size=page_size,
         q_len_per_req=query_width,
-        max_logits_bytes=2 * table.shape[1] * 64 * 4,
+        max_logits_bytes=2 * table.shape[1] * page_size * torch.float32.itemsize,
     )
     metadata = indexer.DCPIndexerMetadata()
     with mock.patch.object(
@@ -238,13 +239,14 @@ def test_backend_refresh_and_draft_updates_invalidate_index_plan(degree, monkeyp
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_decode_plan_graph_refreshes_ownership_and_lengths():
+    page_size = 64
     table = torch.tensor([[1, 2, 3], [2, 4, 6]], dtype=torch.int32, device="cuda")
     lengths = torch.tensor([145, 129], dtype=torch.int32, device="cuda")
     kwargs = dict(
-        placement=CachePlacement(64, 9, (0, 1), 0),
-        page_size=64,
+        placement=CachePlacement(page_size, 9, (0, 1), 0),
+        page_size=page_size,
         q_len_per_req=2,
-        max_logits_bytes=3 * 64 * 4,
+        max_logits_bytes=table.shape[1] * page_size * torch.float32.itemsize,
     )
 
     def forward():
@@ -317,6 +319,7 @@ def test_extend_metadata_clears_old_decode_memo(mixed, monkeypatch):
 @pytest.mark.parametrize(
     "batch,columns,tile_sizes", [(2, 2, [2]), (64, 4096, [64]), (65, 4096, [64, 1])]
 )
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA slot conversion")
 def test_model_reuses_plan_but_maps_each_layers_candidates(
     batch, columns, tile_sizes, monkeypatch
 ):
@@ -325,12 +328,12 @@ def test_model_reuses_plan_but_maps_each_layers_candidates(
     memo = indexer.DCPIndexerMetadata()
     placement = CachePlacement(64, 9, (0,), 0)
     # Cover the 64 MiB decode tiling boundary without allocating large logits.
-    table = torch.zeros(batch, columns, dtype=torch.int32)
+    table = torch.zeros(batch, columns, dtype=torch.int32, device="cuda")
     table[:, :2] = torch.tensor([7, 1], dtype=torch.int32)
     table[0, :2] = torch.tensor([5, 2], dtype=torch.int32)
-    lengths = torch.full((batch,), 81, dtype=torch.int32)
+    lengths = torch.full((batch,), 81, dtype=torch.int32, device="cuda")
     lengths[0] = 70
-    cache = torch.empty((8 * 64, 132), dtype=torch.uint8)
+    cache = torch.empty((8 * 64, 132), dtype=torch.uint8, device="cuda")
     ctx = SimpleNamespace(
         num_extends=1,
         attn_backend=SimpleNamespace(
@@ -360,10 +363,16 @@ def test_model_reuses_plan_but_maps_each_layers_candidates(
         assert causal.tolist() == lengths[requests.long()].tolist()
         seen.append(tile)
         # Different layers choose different positions; only the mappings reuse.
-        offsets = torch.tensor([[2, -1]], dtype=torch.int32).repeat(q.shape[0], 1)
-        scores = torch.tensor([[1.0, -torch.inf]]).repeat(q.shape[0], 1)
-        offsets[requests == 0] = torch.tensor([iteration, 64], dtype=torch.int32)
-        scores[requests == 0] = torch.tensor([3.0, 2.0])
+        offsets = torch.tensor([[2, -1]], dtype=torch.int32, device=q.device).repeat(
+            q.shape[0], 1
+        )
+        scores = torch.tensor([[1.0, -torch.inf]], device=q.device).repeat(
+            q.shape[0], 1
+        )
+        offsets[requests == 0] = torch.tensor(
+            [iteration, 64], dtype=torch.int32, device=q.device
+        )
+        scores[requests == 0] = torch.tensor([3.0, 2.0], device=q.device)
         return offsets, scores
 
     monkeypatch.setattr(indexer, "dsa_index_candidates", candidates)
@@ -373,9 +382,11 @@ def test_model_reuses_plan_but_maps_each_layers_candidates(
         for iteration in range(2):
             result = layer._compute_decode_topk_indices_portable(
                 indexer_output=glm5.GlmDsaIndexerOutput(
-                    torch.zeros(batch + 1, 16, 128, dtype=torch.bfloat16),
+                    torch.zeros(
+                        batch + 1, 16, 128, dtype=torch.bfloat16, device="cuda"
+                    ),
                     torch.empty(0),
-                    torch.zeros(batch + 1, 16),
+                    torch.zeros(batch + 1, 16, device="cuda"),
                 ),
                 ctx=ctx,
                 seq_lens=lengths[:],

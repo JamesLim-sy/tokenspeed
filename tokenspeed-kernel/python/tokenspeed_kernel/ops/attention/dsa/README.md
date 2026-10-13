@@ -40,12 +40,18 @@ or top-k sizes, and installations without CuTe DSL retain the existing
 of its survivor capacity before CUDA-graph capture; later batch shapes use
 those compiled variants.
 
-Scoring, logits capacity, the full-width mask, and candidate gathering are
-unchanged. The mask preserves mandatory global windows as `+inf`; do not
-apply the ordinary decode non-finite cleanup after those markings. Selected
-offsets are mapped back to global logical positions before DCP exchange.
-Tie order remains unspecified, and gathering drops candidates scoring
-`-inf`. This change does not alter attention-core selection or cache ownership.
+Scoring and logits capacity are unchanged. Length-aware selection masks only
+the valid prefix and reuses DeepSelect's returned values; the full-width
+fallback still initializes the entire logits tail. The mask preserves mandatory
+global windows as `+inf`; do not apply the ordinary decode non-finite cleanup
+after those markings. Gathering bounds every selected offset before reading
+positions or logits, then emits interleaved int32 position/FP32-score-bit views
+that runtime can exchange without repacking. Tie order remains unspecified,
+and gathering drops candidates scoring `-inf`. Attention-core selection and
+cache ownership are unchanged.
+
+Candidate exchange retains global `torch.topk`. Its gather kernel processes
+selected entries in bounded blocks; the block size does not restrict `topk`.
 
 ## Index-K plane formats
 

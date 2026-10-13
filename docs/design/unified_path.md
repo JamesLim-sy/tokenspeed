@@ -72,55 +72,17 @@ can never see a silently-defaulted one. This is deliberate — a `= False`
 default once hid `extend_with_prefix` being swallowed by a composite's
 `**kwargs`, and FlashMLA planned a ragged prefill for a prefix-cached batch.
 
-### DCP indexer planning across layers
+### DCP decode planning
 
-Each DSA leaf owns a per-forward `DCPIndexerMetadata` memo for decode index
-planning. It translates virtual kernel pages with the cache group's scheduler
-block geometry and constructs each query row's causal endpoint once. Each query
-tile then reuses its selected kernel's derived state: DeepGEMM's compact pages,
-logical positions, local lengths and scheduler plan, or Triton's sanitized
-request rows. Queries, weights, Index-K values, logits and candidates remain
-layer-specific. Prefill retains tile-local preparation to avoid retaining all
-of a long prompt's expanded metadata across layers.
+DSA cache-group backends reuse derived page mappings and kernel plans across
+layers of one decode forward; logits and top-k results remain layer-specific.
+Any input refresh or cache-pool rebind invalidates this metadata, even when
+input addresses are unchanged. Eager and capture share preparation, and replay
+recomputes the metadata from refreshed, pointer-stable inputs. Prefill planning
+remains tile-local.
 
-The memo lives on the leaf, outside its pointer-stable decode-metadata slots,
-like other per-forward memos. Decode refresh, mixed initialization and draft
-length updates replace it; extend initialization and cache-pool rebinding clear
-it. It owns no request lifecycle state. The model obtains it through the DSA
-router accessor, under the same single-group contract as its decode metadata.
-
-Eager and capture use the same first-layer preparation. The runner refreshes
-before capture as it does before eager execution, so warmup state is discarded.
-Capture records the preparation kernels once, before all consuming layers;
-replay runs those kernels from the refreshed persistent page-table and length
-buffers. Replacing the Python memo before replay does not move graph inputs.
-Input views and ownership geometry must agree across users of one memo, and
-changing their contents requires a new forward's memo even if addresses match.
-
-The plan also owns the query tile size, which selection reuses across layers.
-The model supplies its named 64 MiB decode logits budget once when preparing
-the plan; selection reuses the plan's budget and tile size. This preserves the
-existing query tiling policy. Prefill supplies its configured positive budget
-to the same selection path. Both target logical FP32 logits per tile, allowing
-at least one query row; kernel padding, selector scratch, candidate exchange
-and retained metadata cost extra. The budget is not a peak-memory cap or a
-fixed allocation: eager logits are temporary, while graph capture retains
-their underlying storage in its memory pool for replay and reuse.
-
-### DCP candidate exchange
-
-Each query tile exchanges its local candidates through the ordinary communication
-backend in both eager and graph execution. The indexer produces int32 global
-logical positions and FP32 scores. Pack these into interleaved int32 records,
-preserving score bits, and issue one all-gather. An empty shard still contributes
-its fixed-capacity padding records. The receiving view preserves source-rank and
-candidate order for the existing global top-k and validity filtering.
-
-Packing reduces collective calls from two to one, while retaining eight payload
-bytes per candidate. The pack and the backend's row-layout conversion remain
-part of the cost; this contract does not imply fewer transmitted bytes. Other
-input dtypes retain the existing separate exchanges. A singleton group requires
-no exchange.
+DCP candidate and partial exchanges use the common communication backend in
+both eager and graph execution, preserving candidate order and FP32 weighting.
 
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
