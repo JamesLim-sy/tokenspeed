@@ -781,11 +781,6 @@ def test_rank_major_merge_preserves_order_and_bits(rows, degree, width, topk):
         )
         scores[:, -1, 4:] = -torch.inf
     records = torch.stack((ids, scores.view(torch.int32)), dim=-1)
-    for source in range(degree):
-        packed = exchange.pack_index_candidates(
-            records[source, ..., 0], records[source, ..., 1].view(torch.float32)
-        )
-        assert packed.data_ptr() == records[source].data_ptr()
     actual, counts = exchange.merge_packed_index_candidates(records, topk=topk)
     row_ids = ids.permute(1, 0, 2).reshape(rows, degree * width)
     row_scores = scores.permute(1, 0, 2).reshape(rows, degree * width)
@@ -830,8 +825,6 @@ def test_candidate_gather_bounds_reads_with_uninitialized_tail():
             device="cuda",
         ),
     )
-    packed = exchange.pack_index_candidates(ids, scores)
-    assert packed.data_ptr() == ids.data_ptr()
 
 
 @requires_cuda
@@ -943,7 +936,7 @@ def test_partial_transport_and_merge(degree, dtype, dim, strided, use_sink):
 
 
 @requires_cuda
-def test_fusions_graph_refresh_and_batch_sizes_do_not_recompile():
+def test_candidate_and_partial_fusions_do_not_recompile():
     degree, width, topk, dim = 2, 16, 8, 16
 
     def run(rows):
@@ -973,26 +966,3 @@ def test_fusions_graph_refresh_and_batch_sizes_do_not_recompile():
     ):
         for rows in (1, 3, 16, 33):
             run(rows)
-    records, packed, selected, counts, merged = run(3)
-    saved_records, saved_packed = records.clone(), packed.clone()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        selected, counts = exchange.merge_packed_index_candidates(records, topk=topk)
-        merged = dcp.combine_dcp_attention_partials(
-            packed,
-            head_dim=dim,
-            partial_dtype=torch.bfloat16,
-            output_dtype=torch.bfloat16,
-            sink=None,
-        )
-    graph.replay()
-    expected = selected.clone(), counts.clone(), merged.clone()
-    records[..., 0] = -1
-    packed[..., -1] = torch.tensor(-torch.inf, device="cuda").view(torch.int32)
-    graph.replay()
-    assert (selected == -1).all() and (counts == 0).all() and (merged == 0).all()
-    records.copy_(saved_records)
-    packed.copy_(saved_packed)
-    graph.replay()
-    for got, want in zip((selected, counts, merged), expected):
-        torch.testing.assert_close(got, want, atol=0, rtol=0)

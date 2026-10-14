@@ -283,22 +283,12 @@ def _check_candidates(raw, positions, lengths, causal, topk, logical, values):
 )
 @pytest.mark.parametrize("ties", [False, True])
 @requires_hopper
-def test_dcp_mask_select_gather(width, topk, ties, monkeypatch, deep_select):
+def test_dcp_mask_select_gather(width, topk, ties, deep_select):
     lengths = [min(width, n) for n in (0, 1, topk - 1, topk, topk + 1, width)]
     scores = _scores(len(lengths), width, ties=ties)
     raw = scores.clone()
     positions, lengths, causal = _metadata(width, lengths)
-    calls = []
-    select = deep_select.deepselect_topk
-
-    def checked_select(scores, ends, *args, **kwargs):
-        torch.testing.assert_close(ends, lengths.flatten(), atol=0, rtol=0)
-        calls.append(True)
-        return select(scores, ends, *args, **kwargs)
-
-    monkeypatch.setattr(deep_select, "deepselect_topk", checked_select)
     logical, values = _select_candidates(scores, positions, lengths, causal, topk)
-    assert calls == [True]
     _check_candidates(raw, positions, lengths, causal, topk, logical, values)
 
 

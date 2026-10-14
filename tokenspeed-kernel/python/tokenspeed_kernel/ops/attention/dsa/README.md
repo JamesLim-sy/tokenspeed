@@ -194,33 +194,12 @@ initial/local candidates use `+inf`. Cross-rank merging belongs to runtime DCP.
 Runtime setup validates a positive power-of-two candidate count when the KVP
 group has multiple ranks, using the cache-parallel topology (`kvp_group` /
 `kvp_size`). Single-rank selection keeps its existing top-k choices.
-The paged backend also validates the kernel page size at initialization.
-Index tiling validates its logits budget when building a plan; later layers
-check that the current inputs still match that plan. Selector alignment and
-storage bounds remain per-call checks because logits views can change.
 
 DeepGEMM compacts owned, causally visible pages and maps results back to global
 offsets, masking padding and handling partial tails and empty shards. Query
 quantization and head padding match the unsharded path; portable Triton provides
 the same interface. Query tiling bounds scratch memory, and fixed-shape GPU
 metadata supports CUDA graph replay without host reads.
-
-The optional `DSAIndexMetadata` argument shares a query tile's planning across
-layers of one forward. Construct it from the same local page table, contiguous
-request IDs, contiguous causal lengths and page size passed to
-`dsa_index_candidates`. DeepGEMM reuses compact pages, global logical positions,
-true local lengths, dummy nonzero scheduler lengths and its scheduler plan;
-Triton reuses sanitized request IDs and causal lengths. Each call still scores
-its own queries, weights and Index-K values.
-
-The caller replaces the metadata after every input refresh, including changes
-in place. Different views or selected kernels cannot reuse the same state.
-Prepare fresh metadata before capture: first use records preparation kernels
-once and graph replay recomputes them from the captured inputs. Kernels must
-advertise `index_candidate_metadata` to receive the optional argument; selection
-never silently discards supplied metadata. Omitting it retains per-call planning.
-Retained planning storage grows with total query rows times page-table columns;
-runtime enables cross-layer reuse for decode, leaving prefill tile-local.
 
 The Triton FP8 indexer skips Q/K scoring for tiles with no causally visible,
 owned entries. Empty tiles still write negative-infinite logits, including

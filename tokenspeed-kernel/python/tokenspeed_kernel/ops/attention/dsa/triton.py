@@ -20,14 +20,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.dsa._index_metadata import (
-    INDEX_METADATA_FEATURE,
-    DSAIndexMetadata,
-)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -206,7 +200,10 @@ def _dsa_dense_kv_kernel(
     head_dim: tl.constexpr,
     kv_lora_rank: tl.constexpr,
     qk_rope_head_dim: tl.constexpr,
-    kv_dim: tl.constexpr,
+    page_stride,
+    token_stride,
+    channel_stride,
+    PAGE_SIZE: tl.constexpr,
     topk: tl.constexpr,
     softmax_scale: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
@@ -244,20 +241,25 @@ def _dsa_dense_kv_kernel(
             other=0,
         ).to(tl.int64)
         valid = valid & (slots >= 0)
+        kv_rows = (slots // PAGE_SIZE) * page_stride + (
+            slots % PAGE_SIZE
+        ) * token_stride
         score = tl.zeros((BLOCK_TOPK,), tl.float32)
 
         for k_start in range(0, kv_lora_rank, BLOCK_K):
             ks = k_start + k_offsets
             q_vals = tl.load(q + q_nope_base + ks).to(tl.float32)
             k_vals = tl.load(
-                kv + slots[:, None] * kv_dim + ks[None, :],
+                kv + kv_rows[:, None] + ks[None, :] * channel_stride,
                 mask=valid[:, None],
                 other=0.0,
             ).to(tl.float32)
             score += tl.sum(k_vals * q_vals[None, :], axis=1)
 
         k_rope = tl.load(
-            kv + slots[:, None] * kv_dim + kv_lora_rank + rope_offsets[None, :],
+            kv
+            + kv_rows[:, None]
+            + (kv_lora_rank + rope_offsets[None, :]) * channel_stride,
             mask=valid[:, None] & (rope_offsets[None, :] < qk_rope_head_dim),
             other=0.0,
         ).to(tl.float32)
@@ -278,20 +280,25 @@ def _dsa_dense_kv_kernel(
             other=0,
         ).to(tl.int64)
         valid = valid & (slots >= 0)
+        kv_rows = (slots // PAGE_SIZE) * page_stride + (
+            slots % PAGE_SIZE
+        ) * token_stride
         score = tl.zeros((BLOCK_TOPK,), tl.float32)
 
         for k_start in range(0, kv_lora_rank, BLOCK_K):
             ks = k_start + k_offsets
             q_vals = tl.load(q + q_nope_base + ks).to(tl.float32)
             k_vals = tl.load(
-                kv + slots[:, None] * kv_dim + ks[None, :],
+                kv + kv_rows[:, None] + ks[None, :] * channel_stride,
                 mask=valid[:, None],
                 other=0.0,
             ).to(tl.float32)
             score += tl.sum(k_vals * q_vals[None, :], axis=1)
 
         k_rope = tl.load(
-            kv + slots[:, None] * kv_dim + kv_lora_rank + rope_offsets[None, :],
+            kv
+            + kv_rows[:, None]
+            + (kv_lora_rank + rope_offsets[None, :]) * channel_stride,
             mask=valid[:, None] & (rope_offsets[None, :] < qk_rope_head_dim),
             other=0.0,
         ).to(tl.float32)
@@ -303,7 +310,7 @@ def _dsa_dense_kv_kernel(
         denom += tl.sum(probs, axis=0)
 
         v_vals = tl.load(
-            kv + slots[:, None] * kv_dim + v_offsets[None, :],
+            kv + kv_rows[:, None] + v_offsets[None, :] * channel_stride,
             mask=valid[:, None] & v_mask[None, :],
             other=0.0,
         ).to(tl.float32)
@@ -381,7 +388,12 @@ def _run_dense_kv(
     qk_rope_head_dim: int,
     return_lse: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    kv_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
+    if kv_cache.dim() == 4:
+        kv_cache = (
+            kv_cache.squeeze(1) if kv_cache.shape[1] == 1 else kv_cache.squeeze(2)
+        )
+    elif kv_cache.dim() == 3 and kv_cache.shape[1] == 1:
+        kv_cache = kv_cache.squeeze(1)
     out = torch.empty(
         (q.shape[0], q.shape[1], kv_lora_rank),
         dtype=torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype,
@@ -405,7 +417,10 @@ def _run_dense_kv(
         q.shape[2],
         kv_lora_rank,
         qk_rope_head_dim,
-        kv_dim,
+        kv_cache.stride(0),
+        kv_cache.stride(-2),
+        kv_cache.stride(-1),
+        kv_cache.shape[1] if kv_cache.dim() == 3 else 1,
         topk_indices.shape[1],
         float(softmax_scale),
         BLOCK_TOPK=32,
@@ -421,16 +436,6 @@ def _flatten_packed_kv_cache(packed_kv_cache: torch.Tensor) -> torch.Tensor:
     if packed_kv_cache.dim() == 2:
         return packed_kv_cache
     return packed_kv_cache.reshape(-1, packed_kv_cache.shape[-1])
-
-
-def _flatten_dense_kv_cache(kv_cache: torch.Tensor) -> torch.Tensor:
-    if kv_cache.dim() == 2:
-        return kv_cache
-    if kv_cache.dim() == 3:
-        return kv_cache.squeeze(1)
-    if kv_cache.shape[1] == 1:
-        kv_cache = kv_cache.permute(0, 2, 1, 3)
-    return kv_cache.reshape(-1, kv_cache.shape[-1])
 
 
 def _flatten_query(q: torch.Tensor) -> torch.Tensor:
@@ -478,7 +483,7 @@ def _run_dsa(
     else:
         result, lse = _run_dense_kv(
             q,
-            _flatten_dense_kv_cache(kv_cache).contiguous(),
+            kv_cache,
             topk_slots,
             topk_lens,
             softmax_scale=softmax_scale,
@@ -767,12 +772,6 @@ def triton_dsa_prefill_topk_fp8(
     )
 
 
-@dataclass(frozen=True)
-class _TritonIndexMetadata:
-    requests: torch.Tensor
-    causal_lens: torch.Tensor
-
-
 def triton_dsa_index_candidates(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -786,7 +785,6 @@ def triton_dsa_index_candidates(
     softmax_scale: float,
     initial_tokens: int,
     local_tokens: int,
-    metadata: DSAIndexMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score owned Index-K pages and return (logical offsets, FP32 scores).
 
@@ -810,20 +808,11 @@ def triton_dsa_index_candidates(
         raise ValueError("Index candidate rows must match queries")
     if local_page_table.shape[0] == 0 or local_page_table.shape[1] == 0:
         raise ValueError("Index candidates require a nonempty page table")
-    prepared = None if metadata is None else metadata.state
-    if prepared is not None and not isinstance(prepared, _TritonIndexMetadata):
-        raise TypeError("Invalid Triton index metadata state")
-    if prepared is None:
-        valid_requests = (query_requests >= 0) & (
-            query_requests < local_page_table.shape[0]
-        )
-        prepared = _TritonIndexMetadata(
-            query_requests.clamp(0, local_page_table.shape[0] - 1),
-            torch.where(valid_requests, causal_lens, 0),
-        )
-        if metadata is not None:
-            metadata.state = prepared
-    query_requests, causal_lens = prepared.requests, prepared.causal_lens
+    valid_requests = (query_requests >= 0) & (
+        query_requests < local_page_table.shape[0]
+    )
+    query_requests = query_requests.clamp(0, local_page_table.shape[0] - 1)
+    causal_lens = torch.where(valid_requests, causal_lens, 0)
     q, weights = q.contiguous(), weights.float().contiguous()
     row_bytes, page_stride = _check_packed_fp8_inputs(
         q, index_k_cache, weights, page_size
@@ -869,7 +858,6 @@ def triton_dsa_index_candidates(
     "dsa_index_candidates",
     name="triton_dsa_sharded_index_candidates",
     solution="triton",
-    features=frozenset({INDEX_METADATA_FEATURE}),
     signatures=_TOPK_SIGNATURES,
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
@@ -887,7 +875,6 @@ def triton_dsa_sharded_index_candidates(
     softmax_scale: float,
     initial_tokens: int,
     local_tokens: int,
-    metadata: DSAIndexMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if current_platform().is_nvidia:
         quantized, scale = quantize_fp8(
@@ -912,5 +899,4 @@ def triton_dsa_sharded_index_candidates(
         softmax_scale=softmax_scale,
         initial_tokens=initial_tokens,
         local_tokens=local_tokens,
-        metadata=metadata,
     )

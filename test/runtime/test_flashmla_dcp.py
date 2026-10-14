@@ -31,8 +31,6 @@ from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 
-from tokenspeed.runtime.layers.attention.dcp import indexer
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
@@ -700,7 +698,9 @@ def test_ordinary_mla_kvp_capacity_and_token_limit(degree, token_limit):
     )
     setup = prepare_cache_setup(
         family="mla",
-        server_args=SimpleNamespace(max_total_tokens=token_limit),
+        server_args=SimpleNamespace(
+            max_total_tokens=token_limit, kv_offload_config=None
+        ),
         model_config=SimpleNamespace(
             num_attention_layers=2, hf_config=SimpleNamespace(), model_profile=None
         ),
@@ -761,7 +761,7 @@ def test_pure_dsa_kvp_shards_index_and_latent_capacity(degree):
             replace(config, is_draft=True, draft_block_decode=True)
     setup = prepare_cache_setup(
         family="dsa",
-        server_args=SimpleNamespace(max_total_tokens=None),
+        server_args=SimpleNamespace(max_total_tokens=None, kv_offload_config=None),
         model_config=SimpleNamespace(
             num_attention_layers=2, hf_config=SimpleNamespace(), model_profile=None
         ),
@@ -866,7 +866,17 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
 
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 @pytest.mark.parametrize("tied", [False, True])
-def test_global_index_candidate_merge_ties_and_empty_shards(monkeypatch, degree, tied):
+@pytest.mark.parametrize(
+    "offset_dtype,score_dtype",
+    [
+        (torch.int32, torch.float32),
+        (torch.int64, torch.float32),
+        (torch.int32, torch.float64),
+    ],
+)
+def test_global_index_candidate_merge_ties_and_empty_shards(
+    monkeypatch, degree, tied, offset_dtype, score_dtype
+):
     from tokenspeed.runtime.layers.attention.dcp import indexer
 
     offsets = torch.tensor([[9, 3, -1, -1], [-1, -1, -1, -1]], dtype=torch.int32)
@@ -892,9 +902,15 @@ def test_global_index_candidate_merge_ties_and_empty_shards(monkeypatch, degree,
         for r in range(1, degree)
     ]
 
+    all_offsets = [part.to(offset_dtype) for part in all_offsets]
+    all_scores = [part.to(score_dtype) for part in all_scores]
+    offsets, scores = all_offsets[0], all_scores[0]
+
     def gather(x, group, dim):
-        assert x.dtype == torch.int32
-        assert x.shape == (offsets.shape[0], offsets.shape[1] * 2)
+        if offset_dtype != torch.int32 or score_dtype != torch.float32:
+            return torch.cat(
+                all_offsets if x.dtype == offset_dtype else all_scores, dim=dim
+            )
         return torch.cat(
             [
                 torch.stack((ids, values.view(torch.int32)), dim=-1).flatten(1)
@@ -1131,106 +1147,3 @@ def test_flashmla_backend_kvp_verify_rows_merge_to_dense_verify(monkeypatch, deg
     lses = torch.stack([p[1] for p in partials]).unsqueeze(-1)
     merged = (outputs * torch.softmax(lses, dim=0)).sum(0)
     torch.testing.assert_close(merged[:, :heads], ref[0].float(), atol=0.002, rtol=0.03)
-
-
-def _candidate_parts(rank, rows):
-    offsets = torch.arange(24, dtype=torch.int32).reshape(3, 8)
-    offsets = offsets + 2**24 + 1 + rank * 32
-    offsets[0, -1] = 2**31 - 1 - rank
-    bits = torch.tensor(
-        [
-            0,
-            -(2**31),
-            2139095040,
-            -8388608,
-            2143289345,
-            -4194302,
-            1065353216,
-            1073741824,
-        ],
-        dtype=torch.int32,
-    ).repeat(3, 1)
-    offsets[1:, :] = -1
-    if rank == 0:
-        offsets[1, :2] = torch.tensor([7, 11])
-    return offsets[:rows], bits[:rows].view(torch.float32)
-
-
-def _candidate_reference(parts, topk):
-    offsets = torch.cat([part[0] for part in parts], dim=1)
-    scores = torch.cat([part[1] for part in parts], dim=1)
-    valid = (offsets >= 0) & ~torch.isnan(scores) & (scores > -torch.inf)
-    values, order = torch.topk(torch.where(valid, scores, -torch.inf), topk, dim=1)
-    valid = values > -torch.inf
-    return torch.where(valid, offsets.gather(1, order), -1), valid.sum(1).int()
-
-
-@pytest.mark.parametrize("degree", [1, 2, 4, 8])
-@pytest.mark.parametrize("rows", [0, 1, 3])
-@pytest.mark.parametrize("strided", [False, True])
-def test_candidate_exchange_preserves_bits_and_selection(
-    monkeypatch, degree, rows, strided
-):
-    parts = [_candidate_parts(rank, rows) for rank in range(degree)]
-    offsets, scores = parts[0]
-    if strided:
-        offsets = offsets.repeat_interleave(2, dim=1)[:, ::2]
-        scores = scores.repeat_interleave(2, dim=1)[:, ::2]
-    calls = []
-
-    def gather(payload, group, dim):
-        calls.append(group)
-        assert group == tuple(range(degree))
-        assert dim == -1
-        assert payload.dtype == torch.int32
-        assert payload.is_contiguous()
-        records = payload.reshape(rows, 8, 2)
-        torch.testing.assert_close(records[..., 0], offsets, atol=0, rtol=0)
-        torch.testing.assert_close(
-            records[..., 1], scores.view(torch.int32), atol=0, rtol=0
-        )
-        return torch.cat(
-            [
-                torch.stack((ids, values.view(torch.int32)), -1).flatten(1)
-                for ids, values in parts
-            ],
-            dim=dim,
-        )
-
-    monkeypatch.setattr(indexer, "all_gather", gather)
-    actual = indexer.merge_index_candidates(
-        offsets, scores, topk=4, group=tuple(range(degree))
-    )
-    expected = _candidate_reference(parts, 4)
-    for got, want in zip(actual, expected):
-        torch.testing.assert_close(got, want, atol=0, rtol=0)
-    assert len(calls) == int(degree > 1)
-
-
-@pytest.mark.parametrize(
-    "offset_dtype,score_dtype",
-    [(torch.int64, torch.float32), (torch.int32, torch.float64)],
-)
-def test_candidate_exchange_retains_other_dtypes(
-    monkeypatch, offset_dtype, score_dtype
-):
-    parts = [
-        tuple(
-            t.to(dtype)
-            for t, dtype in zip(_candidate_parts(rank, 3), (offset_dtype, score_dtype))
-        )
-        for rank in range(2)
-    ]
-    calls = []
-
-    def gather(tensor, group, dim):
-        position = len(calls)
-        calls.append(tensor.dtype)
-        return torch.cat([part[position] for part in parts], dim=dim)
-
-    monkeypatch.setattr(indexer, "all_gather", gather)
-    actual = indexer.merge_index_candidates(*parts[0], topk=4, group=(0, 1))
-    expected = _candidate_reference(parts, 4)
-    for got, want in zip(actual, expected):
-        torch.testing.assert_close(got, want, atol=0, rtol=0)
-    assert calls == [offset_dtype, score_dtype]

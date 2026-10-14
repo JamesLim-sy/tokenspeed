@@ -158,6 +158,9 @@ def _run_idle_round(drafter) -> list[ForwardMode]:
     target_calls: list[ForwardMode] = []
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cpu"
+    executor.device_module = torch.get_device_module(executor.device)
+    executor.default_stream = executor.device_module.current_stream()
+    executor.execution_stream = executor.device_module.Stream()
     executor.input_buffers = SimpleNamespace(
         req_pool_indices_buf=torch.zeros(4, dtype=torch.int64)
     )
@@ -308,7 +311,6 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
 
         k, bs = 4, 2
         backend = dsa_mod.DSABackend.__new__(dsa_mod.DSABackend)
-        backend.dcp_group = (0,)
         backend.spec_num_tokens = k
         backend.kernel_page_size = 64
         seq_lens_k = torch.tensor([9, 5], dtype=torch.int32)
@@ -357,7 +359,6 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_mod
 
         backend = dsa_mod.DSABackend.__new__(dsa_mod.DSABackend)
-        backend.dcp_group = (0,)
         backend.spec_num_tokens = 4
         backend.kernel_page_size = 64
         metadata = SimpleNamespace(
@@ -400,7 +401,6 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
 
         k, bs = 4, 2
         backend = dsa_mod.DSABackend.__new__(dsa_mod.DSABackend)
-        backend.dcp_group = (0,)
         backend.spec_num_tokens = k
         backend.kernel_page_size = 64
         metadata = TRTLLMMLADecodeMetadata(
