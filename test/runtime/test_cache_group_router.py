@@ -1777,6 +1777,7 @@ class PagedLeafRebindTest(unittest.TestCase):
             _bind=lambda pool: None,
         )
         backend._prefill_page_table = object()
+        backend._dcp_indexer = object()
         backend.kpool_runtime = SimpleNamespace(prefill_plan=object())
         backend.kpool_runtime.reset_forward = lambda req_pool_indices: setattr(
             backend.kpool_runtime, "prefill_plan", None
@@ -1787,6 +1788,7 @@ class PagedLeafRebindTest(unittest.TestCase):
 
         self.assertIs(backend.cache_pool, pool)
         self.assertIsNone(backend._prefill_page_table)
+        self.assertIsNone(backend._dcp_indexer)
         self.assertIsNone(backend.kpool_runtime.prefill_plan)
 
 

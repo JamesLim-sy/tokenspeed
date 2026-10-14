@@ -20,8 +20,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.dsa._index_metadata import (
+    INDEX_METADATA_FEATURE,
+    DSAIndexMetadata,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -772,6 +778,12 @@ def triton_dsa_prefill_topk_fp8(
     )
 
 
+@dataclass(frozen=True)
+class _TritonIndexMetadata:
+    requests: torch.Tensor
+    causal_lens: torch.Tensor
+
+
 def triton_dsa_index_candidates(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -785,6 +797,7 @@ def triton_dsa_index_candidates(
     softmax_scale: float,
     initial_tokens: int,
     local_tokens: int,
+    metadata: DSAIndexMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score owned Index-K pages and return (logical offsets, FP32 scores).
 
@@ -808,11 +821,20 @@ def triton_dsa_index_candidates(
         raise ValueError("Index candidate rows must match queries")
     if local_page_table.shape[0] == 0 or local_page_table.shape[1] == 0:
         raise ValueError("Index candidates require a nonempty page table")
-    valid_requests = (query_requests >= 0) & (
-        query_requests < local_page_table.shape[0]
-    )
-    query_requests = query_requests.clamp(0, local_page_table.shape[0] - 1)
-    causal_lens = torch.where(valid_requests, causal_lens, 0)
+    prepared = None if metadata is None else metadata.state
+    if prepared is not None and not isinstance(prepared, _TritonIndexMetadata):
+        raise TypeError("Invalid Triton index metadata state")
+    if prepared is None:
+        valid_requests = (query_requests >= 0) & (
+            query_requests < local_page_table.shape[0]
+        )
+        prepared = _TritonIndexMetadata(
+            query_requests.clamp(0, local_page_table.shape[0] - 1),
+            torch.where(valid_requests, causal_lens, 0),
+        )
+        if metadata is not None:
+            metadata.state = prepared
+    query_requests, causal_lens = prepared.requests, prepared.causal_lens
     q, weights = q.contiguous(), weights.float().contiguous()
     row_bytes, page_stride = _check_packed_fp8_inputs(
         q, index_k_cache, weights, page_size
@@ -858,6 +880,7 @@ def triton_dsa_index_candidates(
     "dsa_index_candidates",
     name="triton_dsa_sharded_index_candidates",
     solution="triton",
+    features=frozenset({INDEX_METADATA_FEATURE}),
     signatures=_TOPK_SIGNATURES,
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
@@ -875,6 +898,7 @@ def triton_dsa_sharded_index_candidates(
     softmax_scale: float,
     initial_tokens: int,
     local_tokens: int,
+    metadata: DSAIndexMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if current_platform().is_nvidia:
         quantized, scale = quantize_fp8(
@@ -899,4 +923,5 @@ def triton_dsa_sharded_index_candidates(
         softmax_scale=softmax_scale,
         initial_tokens=initial_tokens,
         local_tokens=local_tokens,
+        metadata=metadata,
     )

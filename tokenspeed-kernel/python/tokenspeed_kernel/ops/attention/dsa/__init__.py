@@ -23,6 +23,10 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel.ops.attention.dsa._index_metadata import (
+    INDEX_METADATA_FEATURE,
+    DSAIndexMetadata,
+)
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -647,6 +651,7 @@ def dsa_index_candidates(
     initial_tokens: int,
     local_tokens: int,
     solution: str | None,
+    metadata: DSAIndexMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score a query tile against owned Index-K pages and select local candidates.
 
@@ -656,9 +661,13 @@ def dsa_index_candidates(
     invalid candidates use (-1, -inf), mandatory candidates use +inf scores.
     ``solution=None`` selects the best supported kernel, or force a solution.
     The caller validates that topk is a positive power of two during setup.
+    ``metadata`` optionally reuses a tile's planning across layers of one
+    forward; its bound input views must match this call. It never caches scores.
     """
     if q.ndim != 3 or weights.shape != q.shape[:2]:
         raise ValueError("Index queries and per-head weights must match")
+    if metadata is not None:
+        metadata.validate(local_page_table, query_requests, causal_lens, page_size)
     query_requests = query_requests.contiguous()
     causal_lens = causal_lens.contiguous()
     if index_k_cache.dtype != torch.uint8:
@@ -692,7 +701,18 @@ def dsa_index_candidates(
             ),
         },
         solution=solution,
+        features=(
+            frozenset({INDEX_METADATA_FEATURE}) if metadata is not None else frozenset()
+        ),
     )
+    metadata_kwargs = {}
+    if metadata is not None:
+        if metadata.kernel_name is not None and metadata.kernel_name != kernel.name:
+            raise ValueError(
+                "DSA index metadata cannot be reused with a different kernel"
+            )
+        metadata.kernel_name = kernel.name
+        metadata_kwargs["metadata"] = metadata
     with kernel_scope(
         "attention", "dsa_index_candidates", q.dtype, kernel_name=kernel.name
     ):
@@ -708,6 +728,7 @@ def dsa_index_candidates(
             softmax_scale=softmax_scale,
             initial_tokens=initial_tokens,
             local_tokens=local_tokens,
+            **metadata_kwargs,
         )
 
 
@@ -1221,7 +1242,9 @@ import tokenspeed_kernel.ops.attention.dsa.gluon  # noqa: E402,F401
 
 __all__ = [
     "CANDIDATE_LENS_CPU_FEATURE",
+    "DSAIndexMetadata",
     "INDEX_K_WORKSPACE_ROWS_FEATURE",
+    "INDEX_METADATA_FEATURE",
     "SLOT_ORDERS",
     "dsa_decode",
     "dsa_prefill",

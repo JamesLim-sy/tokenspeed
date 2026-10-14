@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import os
+from dataclasses import dataclass
 
 import torch
 
@@ -10,6 +11,10 @@ import torch
 from tokenspeed_kernel.ops.attention.dsa import (
     CANDIDATE_LENS_CPU_FEATURE,
     INDEX_K_WORKSPACE_ROWS_FEATURE,
+)
+from tokenspeed_kernel.ops.attention.dsa._index_metadata import (
+    INDEX_METADATA_FEATURE,
+    DSAIndexMetadata,
 )
 from tokenspeed_kernel.ops.attention.dsa._triton import index_candidates
 from tokenspeed_kernel.ops.attention.dsa.cuda import (
@@ -42,6 +47,16 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 platform = current_platform()
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _DeepGemmIndexMetadata:
+    pages: torch.Tensor
+    positions: torch.Tensor
+    lengths: torch.Tensor
+    scoring_lengths: torch.Tensor
+    plan: torch.Tensor
+    num_sms: int
 
 
 _dcp_deep_select = None
@@ -711,6 +726,7 @@ if platform.is_hopper_plus:
         name="deep_gemm_dsa_index_candidates",
         solution="deep_gemm",
         priority=Priority.PERFORMANT,
+        features=frozenset({INDEX_METADATA_FEATURE}),
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0), vendors=frozenset({"nvidia"})
         ),
@@ -743,13 +759,30 @@ if platform.is_hopper_plus:
         softmax_scale: float,
         initial_tokens: int,
         local_tokens: int,
+        metadata: DSAIndexMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        pages, positions, lengths = index_candidates.compact_index_pages(
-            local_page_table,
-            query_requests,
-            causal_lens,
-            page_size,
-        )
+        if deep_gemm.get_pdl() != pdl_enabled():
+            deep_gemm.set_pdl(pdl_enabled())
+        num_sms = deep_gemm.get_num_sms()
+        prepared = None if metadata is None else metadata.state
+        if prepared is not None and not isinstance(prepared, _DeepGemmIndexMetadata):
+            raise TypeError("Invalid DeepGEMM index metadata state")
+        if prepared is None or prepared.num_sms != num_sms:
+            pages, positions, lengths = index_candidates.compact_index_pages(
+                local_page_table, query_requests, causal_lens, page_size
+            )
+            # Empty rows still need dummy scheduler work on the reserved null
+            # page. Selection and masking keep the original zero lengths.
+            scoring_lengths = lengths.clamp_min(1)
+            plan = deep_gemm.get_paged_mqa_logits_metadata(
+                scoring_lengths, page_size, num_sms
+            )
+            prepared = _DeepGemmIndexMetadata(
+                pages, positions, lengths, scoring_lengths, plan, num_sms
+            )
+            if metadata is not None:
+                metadata.state = prepared
+        pages, positions, lengths = prepared.pages, prepared.positions, prepared.lengths
         q, weights = _pad_index_heads(q.contiguous(), weights)
         q_fp8, scale = quantize_fp8(
             q.reshape(-1, q.shape[-1]),
@@ -759,22 +792,13 @@ if platform.is_hopper_plus:
         )
         scale = scale[: q.shape[0] * q.shape[1]].contiguous()
         weights = combine_topk_weights(weights, scale, softmax_scale)
-        if deep_gemm.get_pdl() != pdl_enabled():
-            deep_gemm.set_pdl(pdl_enabled())
-        # DeepGEMM's scheduler requires nonempty work even when this rank
-        # owns no rows. Read the reserved null page for empty rows, then mask
-        # every dummy score using the original (zero) lengths below.
-        scoring_lengths = lengths.clamp_min(1)
-        plan = deep_gemm.get_paged_mqa_logits_metadata(
-            scoring_lengths, page_size, deep_gemm.get_num_sms()
-        )
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_fp8.view(q.shape[0], 1, q.shape[1], q.shape[2]),
             index_k_cache.view(-1, page_size, 1, index_k_cache.shape[-1]),
             weights,
-            scoring_lengths,
+            prepared.scoring_lengths,
             pages,
-            plan,
+            prepared.plan,
             pages.shape[1] * page_size,
             clean_logits=False,
         )
