@@ -194,6 +194,10 @@ initial/local candidates use `+inf`. Cross-rank merging belongs to runtime DCP.
 Runtime setup validates a positive power-of-two candidate count when the KVP
 group has multiple ranks, using the cache-parallel topology (`kvp_group` /
 `kvp_size`). Single-rank selection keeps its existing top-k choices.
+The paged backend also validates the kernel page size at initialization.
+Index tiling validates its logits budget when building a plan; later layers
+check that the current inputs still match that plan. Selector alignment and
+storage bounds remain per-call checks because logits views can change.
 
 DeepGEMM compacts owned, causally visible pages and maps results back to global
 offsets, masking padding and handling partial tails and empty shards. Query

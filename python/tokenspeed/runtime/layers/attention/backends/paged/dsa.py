@@ -493,7 +493,7 @@ class DSABackend(PagedAttentionBackend):
             for_graph_replay=for_graph_replay,
         )
         metadata = self.forward_decode_metadata
-        self._dcp_indexer = DCPIndexerMetadata() if len(self.dcp_group) > 1 else None
+        self._dcp_indexer = DCPIndexerMetadata() if len(self.kvp_group) > 1 else None
         if metadata._dsa_seq_lens_2d is None:
             # First refresh at a lazily-built bs (no capture ran): allocate the
             # per-token rows once on the dense leaf's per-bs view; later
@@ -536,7 +536,7 @@ class DSABackend(PagedAttentionBackend):
         if metadata is None or metadata.seq_lens_k is None:
             raise RuntimeError("DSA draft decode metadata was not initialized")
         metadata.seq_lens_k.copy_(seq_lens[: metadata.seq_lens_k.numel()])
-        self._dcp_indexer = DCPIndexerMetadata() if len(self.dcp_group) > 1 else None
+        self._dcp_indexer = DCPIndexerMetadata() if len(self.kvp_group) > 1 else None
 
         dsa_plan(
             seq_lens_2d=metadata.seq_lens_k.unsqueeze(1),
@@ -562,7 +562,7 @@ class DSABackend(PagedAttentionBackend):
             )
         bs = metadata.seq_lens_k.numel()
         metadata.seq_lens_k.copy_(frontier[:bs])
-        self._dcp_indexer = DCPIndexerMetadata() if len(self.dcp_group) > 1 else None
+        self._dcp_indexer = DCPIndexerMetadata() if len(self.kvp_group) > 1 else None
         self._publish_k_row_indexer_rows(metadata, frontier, bs)
 
     def init_forward_metadata(
@@ -633,7 +633,7 @@ class DSABackend(PagedAttentionBackend):
         if forward_mode.is_mixed() and not self.is_draft:
             metadata = self.forward_decode_metadata
             self._dcp_indexer = (
-                DCPIndexerMetadata() if len(self.dcp_group) > 1 else None
+                DCPIndexerMetadata() if len(self.kvp_group) > 1 else None
             )
             # Per-token context lengths: the paged-MQA-logits kernel only supports
             # next_n == 1, so each verify token is its own row (bs * spec_num_tokens

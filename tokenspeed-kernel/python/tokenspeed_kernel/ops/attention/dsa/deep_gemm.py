@@ -16,9 +16,7 @@ from tokenspeed_kernel.ops.attention.dsa._index_metadata import (
     INDEX_METADATA_FEATURE,
     DSAIndexMetadata,
 )
-from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
-    candidate_topk_offsets,
-)
+from tokenspeed_kernel.ops.attention.dsa._triton import index_candidates
 from tokenspeed_kernel.ops.attention.dsa.cuda import (
     has_ragged_decode_topk,
     ragged_decode_topk,
@@ -208,13 +206,8 @@ def _select_dcp_index_candidates(
     initial_tokens: int,
     local_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
-        gather_index_candidates,
-        mask_index_scores,
-    )
-
     length_aware = _dcp_topk_supports_lengths(scores, topk)
-    mask_index_scores(
+    index_candidates.mask_index_scores(
         scores,
         positions,
         lengths,
@@ -240,9 +233,9 @@ def _select_dcp_index_candidates(
             cluster_size=cluster_size,
         )
     else:
-        offsets = candidate_topk_offsets(scores, topk)
+        offsets = index_candidates.candidate_topk_offsets(scores, topk)
 
-    return gather_index_candidates(
+    return index_candidates.gather_index_candidates(
         offsets,
         scores,
         positions,
@@ -768,10 +761,6 @@ if platform.is_hopper_plus:
         local_tokens: int,
         metadata: DSAIndexMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
-            compact_index_pages,
-        )
-
         if deep_gemm.get_pdl() != pdl_enabled():
             deep_gemm.set_pdl(pdl_enabled())
         num_sms = deep_gemm.get_num_sms()
@@ -779,7 +768,7 @@ if platform.is_hopper_plus:
         if prepared is not None and not isinstance(prepared, _DeepGemmIndexMetadata):
             raise TypeError("Invalid DeepGEMM index metadata state")
         if prepared is None or prepared.num_sms != num_sms:
-            pages, positions, lengths = compact_index_pages(
+            pages, positions, lengths = index_candidates.compact_index_pages(
                 local_page_table, query_requests, causal_lens, page_size
             )
             # Empty rows still need dummy scheduler work on the reserved null

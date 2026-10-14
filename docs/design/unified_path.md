@@ -76,10 +76,16 @@ default once hid `extend_with_prefix` being swallowed by a composite's
 
 DSA cache-group backends reuse derived page mappings and kernel plans across
 layers of one decode forward; logits and top-k results remain layer-specific.
+The backend's KVP group determines whether decode needs this sharded index plan;
+replicated groups keep it absent, including during capture seeding.
 Any input refresh or cache-pool rebind invalidates this metadata, even when
 input addresses are unchanged. Eager and capture share preparation, and replay
 recomputes the metadata from refreshed, pointer-stable inputs. Prefill planning
 remains tile-local.
+
+Static kernel page geometry and sharded candidate counts are validated at
+backend initialization. Forward checks cover current tensor shapes, bound
+metadata views and kernel compatibility; they do not repeat setup checks.
 
 DCP candidate and partial exchanges use the common communication backend in
 both eager and graph execution, preserving candidate order and FP32 weighting.

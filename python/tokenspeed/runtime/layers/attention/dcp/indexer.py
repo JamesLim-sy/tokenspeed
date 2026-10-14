@@ -52,8 +52,9 @@ def _query_tile_rows(columns: int, page_size: int, max_logits_bytes: int) -> int
     This is a tiling target, not a peak-memory cap: kernel row alignment,
     selection scratch, candidate exchange and retained metadata are additional.
     """
-    if columns <= 0 or page_size <= 0:
-        raise ValueError("Index tiling requires positive page geometry")
+    # The backend validates page_size when it binds the kernel geometry.
+    if columns <= 0:
+        raise ValueError("Index tiling requires a nonempty page table")
     if max_logits_bytes <= 0:
         raise ValueError("Index tiling requires a positive logits budget")
     row_bytes = columns * page_size * torch.float32.itemsize
@@ -117,7 +118,6 @@ class DCPIndexerMetadata:
             or seq_lens.ndim != 1
             or page_table.shape[0] != seq_lens.numel()
             or page_table.shape[1] == 0
-            or page_size <= 0
             or q_len_per_req <= 0
         ):
             raise ValueError("Invalid DCP decode index metadata geometry")
@@ -171,7 +171,8 @@ def merge_index_candidates(
     Positive infinity marks mandatory candidates; negative infinity is padding.
     Equal-score candidates have no prescribed logical-position order.
     """
-    if offsets.shape != scores.shape or offsets.ndim != 2 or topk <= 0:
+    # Candidate count and group topology are validated during runtime setup.
+    if offsets.shape != scores.shape or offsets.ndim != 2:
         raise ValueError("Candidate offsets/scores must be matching matrices")
     if (
         offsets.is_cuda
@@ -237,10 +238,12 @@ def select_dsa_topk(
     temporary allocations can exceed this target; it is not a peak-memory cap.
     ``metadata`` optionally supplies the decode forward's prepared mappings;
     the input views, ownership and tiling must match the prepared plan.
+    Page size and candidate count are validated by backend initialization;
+    a prepared plan already owns a validated logits budget.
     """
-    if max_logits_bytes <= 0:
-        raise ValueError("Index tiling requires a positive logits budget")
     if q.shape[0] == 0:
+        if max_logits_bytes <= 0:
+            raise ValueError("Index tiling requires a positive logits budget")
         return (
             torch.empty((0, topk), device=q.device, dtype=torch.int32),
             torch.empty(0, device=q.device, dtype=torch.int32),

@@ -23,6 +23,12 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
+_PARTIAL_TYPES = {
+    torch.float16: tl.float16,
+    torch.bfloat16: tl.bfloat16,
+    torch.float32: tl.float32,
+}
+
 
 @triton.jit
 def _normalize_dcp_partials_kernel(
@@ -507,12 +513,7 @@ def combine_dcp_attention_partials(
         contributes zero; unexpected NaNs propagate. Apply the sink once,
         after merging all sources, and cast only at the final store.
     """
-    types = {
-        torch.float16: tl.float16,
-        torch.bfloat16: tl.bfloat16,
-        torch.float32: tl.float32,
-    }
-    if partial_dtype not in types or output_dtype not in types:
+    if partial_dtype not in _PARTIAL_TYPES or output_dtype not in _PARTIAL_TYPES:
         raise TypeError("DCP merge requires FP16, BF16 or FP32")
     per_word = torch.int32.itemsize // partial_dtype.itemsize
     if (
@@ -546,7 +547,7 @@ def combine_dcp_attention_partials(
             LOCAL_HEADS=heads,
             DIM=head_dim,
             PER_WORD=per_word,
-            PARTIAL_TYPE=types[partial_dtype],
+            PARTIAL_TYPE=_PARTIAL_TYPES[partial_dtype],
             SHARDS=triton.next_power_of_2(degree),
             BLOCK=triton.next_power_of_2(head_dim),
             MIN_NORMAL=torch.finfo(torch.float32).tiny,
