@@ -663,19 +663,18 @@ transfer edge copies the pages its prefill rank and decode rank both own.
 Works with the Host KVStore and the retraction snapshot pool; not yet with
 L3 storage.
 
-For non-PD MLA serving on eight GPUs, retain the model's other launch options
-and set:
+For non-PD MLA serving, use a DCP-capable backend, for example:
 
 ```bash
 ts serve --model MODEL --attention-backend flashmla \
   --attn-tp-size 8 --kv-parallel-size 8 --decode-context-parallel-size 8
 ```
 
-Leave `--disaggregation-mode` at `null` and QCP at 1. The same service handles
-prefill, prefix-cache hits and decode. MLA decode remains absorbed; DCP gathers
-query heads and merges attention partials back to TP-local heads. MLA/KDA
-hybrids shard only MLA history, retaining their KDA state layout. Compare with
-TP8 by setting both KVP and DCP to 1, with the same workload and other options.
+Keep `--disaggregation-mode` at `null` and QCP at 1. Aggregated DCP requires
+separate prefill/decode rounds and rejects `--enable-mixed-batch` for all
+backends, including MLA/DSA. MLA decode remains absorbed; MLA/KDA hybrids
+shard only MLA history. Ordinary TP with KVP = DCP = 1 is unaffected.
+
 Speculative decoding runs on a sharded cache with the backends whose DCP
 decode takes a verify window (FlashMLA, CuTe MLA, GPU DSA); the draft group
 shards like the target's. A FlashMLA verify under KVP runs one kernel row per

@@ -214,16 +214,17 @@ def kernel_override_env_key(family: str, mode: str) -> str:
 
 
 def validate_context_parallel_roles(
-    *, kvp_size: int, dcp_size: int, qcp_size: int, disaggregation_mode: str
+    *,
+    kvp_size: int,
+    dcp_size: int,
+    qcp_size: int,
+    disaggregation_mode: str,
+    enable_mixed_batch: bool,
 ) -> None:
-    """Validate storage and compute parallelism for each engine role.
+    """Validate KVP/DCP roles and the PD-prefill-only QCP layout.
 
-    KVP shards history pages in aggregated, PD prefill and PD decode engines.
-    Engines serving decode (aggregated or PD decode) must explicitly select
-    matching DCP: attend the owned pages and merge partials by LSE. Aggregated
-    engines reuse the backend's sharded-history prefill and DCP decode paths,
-    including mixed batches. QCP remains a PD-prefill-only query-row layout;
-    a prefill engine may also shard storage without QCP.
+    Aggregated and PD decode engines require explicit DCP matching KVP.
+    Aggregated DCP requires separate prefill and decode rounds.
     """
     if dcp_size < 1:
         raise ValueError(
@@ -261,6 +262,11 @@ def validate_context_parallel_roles(
                 f"(got dcp={dcp_size}, kvp={kvp_size}): every rank of the KVP "
                 "group owns pages of every request, so all of them merge the "
                 "partials"
+            )
+        if disaggregation_mode == "null" and enable_mixed_batch:
+            raise ValueError(
+                "Aggregated DCP does not support --enable-mixed-batch; "
+                "remove it to schedule prefill and decode separately"
             )
     elif kvp_size > 1 and disaggregation_mode in ("null", "decode"):
         raise ValueError(
@@ -1141,6 +1147,7 @@ class ServerArgs:
             dcp_size=self.decode_context_parallel_size,
             qcp_size=self.mapping.attn.qcp_size,
             disaggregation_mode=self.disaggregation_mode,
+            enable_mixed_batch=self.enable_mixed_batch,
         )
         validate_qcp(
             qcp_size=self.mapping.attn.qcp_size,
@@ -2551,7 +2558,8 @@ class ServerArgs:
             action="store_true",
             dest="enable_mixed_batch",
             default=ServerArgs.enable_mixed_batch,
-            help="Allow the scheduler to issue prefill and decode requests in the same iteration.",
+            help="Allow the scheduler to issue prefill and decode requests in the "
+            "same iteration. Not supported with aggregated DCP.",
         )
         parser.add_argument(
             "--prefix-granularity",
@@ -3665,8 +3673,7 @@ class ServerArgs:
             "rank attends the KV pages it owns under --kv-parallel-size and the "
             "partials are merged across the KVP group by their log-sum-exp. "
             "Requires --disaggregation-mode null or decode and must equal "
-            "--kv-parallel-size, which requires it in turn on those roles (a "
-            "sharded cache has no other decode).",
+            "--kv-parallel-size. Aggregated DCP does not support --enable-mixed-batch.",
         )
         parser.add_argument(
             "--attn-head-tp-size",

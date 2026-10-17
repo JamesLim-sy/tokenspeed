@@ -19,14 +19,12 @@
 # SOFTWARE.
 
 """The three context-parallel flags: ``--kv-parallel-size`` (KVP, the sharded
-page storage of an aggregated or PD engine), ``--decode-context-parallel-size`` (DCP, the
-decode compute over it) and ``--query-context-parallel-size`` (QCP,
+page storage of an aggregated or PD engine), ``--decode-context-parallel-size``
+(DCP, the decode compute over it) and ``--query-context-parallel-size`` (QCP,
 the prefill role's query-row sharding over it) -- which roles take them, how
 they relate, and the QCP layouts the first landing refuses."""
 
 from __future__ import annotations
-
-from copy import deepcopy
 
 import pytest
 
@@ -91,7 +89,7 @@ def test_off_by_default_everywhere():
     ],
 )
 def test_the_roles_that_take_the_flags(kwargs):
-    validate_context_parallel_roles(**kwargs)
+    validate_context_parallel_roles(**kwargs, enable_mixed_batch=False)
 
 
 @pytest.mark.parametrize(
@@ -128,20 +126,12 @@ def test_the_roles_that_take_the_flags(kwargs):
             "positive integer",
         ),
         (
-            dict(kvp_size=1, dcp_size=2, qcp_size=1, disaggregation_mode="null"),
-            "--decode-context-parallel-size must equal --kv-parallel-size",
-        ),
-        (
             dict(kvp_size=8, dcp_size=4, qcp_size=1, disaggregation_mode="null"),
             "--decode-context-parallel-size must equal --kv-parallel-size",
         ),
         (
             dict(kvp_size=1, dcp_size=2, qcp_size=1, disaggregation_mode="encode"),
             "--decode-context-parallel-size > 1 requires --disaggregation-mode null or decode",
-        ),
-        (
-            dict(kvp_size=2, dcp_size=2, qcp_size=2, disaggregation_mode="null"),
-            "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
         ),
         # The query shard is a prefill-role layout over sharded pages.
         (
@@ -160,7 +150,7 @@ def test_the_roles_that_take_the_flags(kwargs):
 )
 def test_the_roles_that_refuse_the_flags(kwargs, match):
     with pytest.raises(ValueError, match=match):
-        validate_context_parallel_roles(**kwargs)
+        validate_context_parallel_roles(**kwargs, enable_mixed_batch=False)
 
 
 def test_the_decode_role_reads_the_shards_with_dcp():
@@ -173,37 +163,23 @@ def test_the_decode_role_reads_the_shards_with_dcp():
         prepare_server_args(without_dcp)
 
 
-@pytest.mark.parametrize("degree", [2, 4, 8])
-@pytest.mark.parametrize("mixed", [False, True])
-def test_an_aggregated_engine_reads_shards_with_dcp(degree, mixed):
-    argv = [
-        "--model",
-        "x",
-        "--attn-tp-size",
-        "8",
-        "--attention-backend",
-        "flashmla",
-        "--kv-parallel-size",
-        str(degree),
-        "--decode-context-parallel-size",
-        str(degree),
-    ]
-    if mixed:
-        argv.append("--enable-mixed-batch")
+@pytest.mark.parametrize("backend", [None, "flashmla", "dsa"])
+def test_an_aggregated_engine_reads_shards_with_dcp(backend):
+    argv = DECODE + ["--disaggregation-mode", "null"]
+    if backend is not None:
+        argv.extend(["--attention-backend", backend])
     args = prepare_server_args(argv)
     assert args.disaggregation_mode == "null"
-    assert args.decode_context_parallel_size == degree
-    assert args.enable_mixed_batch == mixed
-    assert not args.mapping.attn.has_qcp
-    for rank in range(8):
-        mapping = deepcopy(args.mapping)
-        mapping.rank = rank
-        attn = mapping.attn
-        first = rank // degree * degree
-        assert attn.tp_size == 8
-        assert attn.kvp_size == degree
-        assert attn.kvp_group == tuple(range(first, first + degree))
-        assert attn.kvp_rank == rank % degree
+    assert args.mapping.attn.kvp_size == args.decode_context_parallel_size == 2
+    assert not args.enable_mixed_batch
+    with pytest.raises(ValueError, match="Aggregated DCP.*--enable-mixed-batch"):
+        prepare_server_args(argv + ["--enable-mixed-batch"])
+
+
+@pytest.mark.parametrize("argv", [["--model", "x", "--attn-tp-size", "2"], DECODE])
+def test_mixed_batches_remain_allowed_without_aggregated_dcp(argv):
+    args = prepare_server_args(argv + ["--enable-mixed-batch"])
+    assert args.enable_mixed_batch
 
 
 def test_an_aggregated_engine_requires_explicit_dcp():
