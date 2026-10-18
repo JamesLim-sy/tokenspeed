@@ -108,6 +108,65 @@ eight outputs per lane store C through a row-contiguous layout, 16 bytes per
 lane. An optional XCD remap keeps the M tiles that share a weight tile on one
 XCD's L2.
 
+### gfx950 single-row BF16 GEMV
+
+`gluon_rowcta_bf16_gemv_gfx950` (`gemm/fp16/decode_gemv.py`) computes
+`x @ w.T` for one BF16 row with one program per output: program `n` streams
+weight row `n` (`.cg`) against `x` in `BLOCK_K` chunks, keeps per-lane FP32
+partial sums and reduces them once. `N` programs per launch keep many
+independent weight streams in flight per CU, which suits cold weights.
+
+- `x` is a contiguous `[1, K]` row, `w` a contiguous `[N, K]` matrix and `out`
+  a contiguous `[1, N]` destination, all BF16. `K` is a compile-time constant.
+- `BLOCK_K` and the wave count depend on `K` alone: one wave of 16-byte loads
+  for `K <= 1536`, wider programs above.
+- `gemm.mv` takes it for any single row with `N, K >= 128`. `gemm.mm` hands a
+  single row to this GEMV only for the `(N, K)` shapes in
+  `_PREFERRED_SHAPES`, where it beat mm's own path (Torch's skinny GEMM or
+  hipBLASLt) in cold-cache standalone sweeps. The dense decode GEMV's own
+  measured shapes route single rows to `mv` separately.
+
+### gfx950 dense BF16 decode GEMV
+
+`gluon_gemv_a16w16_gfx950` (`gemm/fp16/gemv.py`) computes `x @ w.T` for
+decode batches, `1 <= M <= 16`, with one program per CU.
+
+#### Contract
+
+- `x` is `[M, K]` with unit inner stride, `w` a contiguous `[N, K]` matrix
+  of `x`'s dtype (BF16 or FP16), `out` an `[M, N]` destination with unit
+  inner stride; `K` is a multiple of 16 and at least 64.
+- Automatic selection (`gemm.mv`, which `gemm.mm` takes for BF16 decode rows)
+  uses it only for the `(N, K)` shapes and M buckets (1, 2-4, 5-16) listed in
+  `_PREFERRED_BUCKETS`, where it beat the default (Torch's skinny GEMM at one
+  row, the decode GEMM or hipBLASLt above) in cold-cache standalone sweeps.
+  Direct calls take any supported shape.
+- One binary per (shape, M bucket): M = 1, and M = 2-16. `M` and `N` are
+  runtime arguments.
+
+#### Algorithm
+
+A program computes `rows = cdiv(N, CUs)` consecutive outputs over full K for
+every row of `x`, padded to a power-of-2 block of `BLOCK_N` rows. Results do
+not depend on `rows`: each output's summation order is fixed by the
+constexprs alone.
+
+- M = 1 (FMA tile): waves split the rows; a lane loads 16 bytes of every
+  512-element K chunk, so one load instruction reads 1 KB of a row. Lanes keep
+  FP32 partial sums per chunk position and reduce once at the end. With up to
+  four rows per wave, the share streams its 512-wide chunks through a ring of
+  four to eight LDS buffers (at most 64 KB) filled by direct-to-LDS copies,
+  one refill in flight per consumed chunk; masked lanes rely on the
+  hardware's out-of-bounds zero fill. The activation row sits in LDS too, so
+  the ring shrinks at long K. The register tile (two chunks in flight, up to
+  128 bytes per lane each) takes the rest: more rows per wave, where it
+  measured 1-8% faster, and shares that leave fewer than four ring chunks.
+- M = 2-16 (MFMA tile): a 16-row batched MFMA whose batch dimension is the
+  wave, so the four waves split every K iteration and reduce through LDS once;
+  weights load K-contiguous and reach the operand layout through LDS.
+- Weight loads are streaming (`.cg`). K loops are unrolled: a loop-carried
+  register copy of a pending load waits for the load and serialized the chunks.
+
 ### gfx950 MXFP8 projection
 
 The gfx950 package provides a prefill-oriented MXFP8 GEMM for DeepSeek V4.1
