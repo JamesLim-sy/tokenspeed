@@ -48,7 +48,7 @@ if platform.is_nvidia:
             )
         q, scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
         if scale.ndim == 1:
-            # Native scales have a 4-row stride and trailing allocation padding.
+            # The flat-buffer ABI uses 4-row alignment and trailing padding.
             rows, columns = x.shape
             padded_rows = (rows + 3) // 4 * 4
             groups = columns // group_size
@@ -154,7 +154,8 @@ if platform.is_nvidia:
         if enable_pdl:
             raise ValueError("TRT-LLM FP8 quantization does not expose PDL control")
         q, scale = _per_token_group_quant_8bit(x, group_size, use_ue8m0=False)
-        # Native storage already has the padded M stride needed by SM90 TMA.
+        # Preserve the native M stride; padding depends on the TRT-LLM ABI.
+        # Consumers may still need to align or repack these scales.
         return q, scale.t()
 
     __all__ = [
