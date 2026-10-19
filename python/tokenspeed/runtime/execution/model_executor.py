@@ -23,11 +23,12 @@ from __future__ import annotations
 import gc
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
+from tokenspeed_kernel.ops.metadata.ngram import commit_ngram_inputs
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.tuning import (
     autotune,
@@ -153,35 +154,6 @@ def _sampling_info_for_requests(
         ]
         info.vocab_mask = mask[::mask_width].contiguous() if prefill else mask
     return info
-
-
-def _with_prefill_sample_offsets(
-    sampling_info: SamplingBatchInfo, input_lengths: torch.Tensor
-) -> SamplingBatchInfo:
-    """Key each prefill row's sample on the position of its last input token.
-
-    The pool kernels draw a request's noise from (seed, offset), and decode
-    and verify take the offset from ``valid_cache_lengths``, which is the
-    absolute position of the step's first input token. A prefill samples
-    before its frontier advances, so that table still holds the chunk's
-    prefix length: a prefix-cache hit or a chunk boundary would move the
-    first sampled token's stream, and the same seeded request would diverge
-    from its first token. The last input position is the same however the
-    prompt was split, and it sits one below the first decode's offset.
-    ``sampling_info`` covers exactly the prefill rows; ``input_lengths`` are
-    their input lengths, in the same order.
-    """
-    cache_lengths = sampling_info.valid_cache_lengths
-    if cache_lengths is None or sampling_info.req_pool_indices is None:
-        return sampling_info
-    pool_rows = sampling_info.req_pool_indices.long()
-    last = cache_lengths.index_select(0, pool_rows) + input_lengths[
-        : pool_rows.shape[0]
-    ].to(cache_lengths.dtype)
-    offsets = cache_lengths.index_copy(
-        0, pool_rows, (last - 1).clamp_min(0).to(cache_lengths.dtype)
-    )
-    return replace(sampling_info, valid_cache_lengths=offsets)
 
 
 def _set_sampled_top_logprobs(
@@ -615,7 +587,11 @@ class ModelExecutor:
             raise NotImplementedError(
                 "Engram input history requires PP=1 and in-flight depth <= 1"
             )
-        self.input_buffers.init_ngram_buffers(ngram_context)
+        self.input_buffers.init_ngram_buffers(
+            ngram_context,
+            model_runner.model.get_ngram_hash_parameters() if ngram_context else None,
+            config.vocab_size,
+        )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             vocab_size=config.vocab_size,
@@ -1532,12 +1508,7 @@ class ModelExecutor:
         sampled_top_k = ctx.sampled_top_k
 
         if num_decodes == 0 and num_prefill_outputs == num_extends:
-            sampled = self.sampling_backend.sample(
-                logits_output,
-                _with_prefill_sample_offsets(
-                    sampling_info, self.input_buffers.input_lengths_buf
-                ),
-            )
+            sampled = self.sampling_backend.sample(logits_output, sampling_info)
             if sampled_top_k:
                 _set_sampled_top_logprobs(
                     logits_output, logits_output.next_token_logits, sampled_top_k
@@ -1582,11 +1553,8 @@ class ModelExecutor:
             )
             tokens, lengths = self.sampling_backend.sample(
                 prefill_out,
-                _with_prefill_sample_offsets(
-                    _sampling_info_for_requests(
-                        sampling_info, prefill, mask_width=mask_width, prefill=True
-                    ),
-                    self.input_buffers.input_lengths_buf,
+                _sampling_info_for_requests(
+                    sampling_info, prefill, mask_width=mask_width, prefill=True
                 ),
             )
             if sampled_top_k:
@@ -1840,8 +1808,25 @@ class ModelExecutor:
                     .to(torch.int32)
                 )
 
+        bs = req_pool_indices.shape[0]
         ib = self.input_buffers
         tail = self.runtime_states.ngram_accepted_tokens
+        if tail is not None:
+            commit_ngram_inputs(
+                req_pool_indices,
+                input_lengths,
+                accept_lengths,
+                ib.input_ids_buf,
+                ib.ngram_previous_tokens_buf,
+                ib.ngram_token_mask_buf,
+                ib.ngram_prefix_buf[:bs],
+                tail,
+                self.runtime_states.ngram_needs_seed,
+                self.runtime_states.valid_cache_lengths,
+                num_extends,
+                ib.state_write_padding_pool_index,
+            )
+            return
         advance_accepted_frontier(
             req_pool_indices,
             input_lengths,
@@ -1849,16 +1834,17 @@ class ModelExecutor:
             self.runtime_states.valid_cache_lengths,
             num_extends,
             ib.state_write_padding_pool_index,
-            ngram_tail=tail,
-            ngram_previous_tokens=ib.ngram_previous_tokens_buf,
-            ngram_token_mask=ib.ngram_token_mask_buf,
-            input_ids=ib.input_ids_buf if tail is not None else None,
         )
 
-    def _build_sampling_info(self, bs: int) -> SamplingBatchInfo:
+    def _build_sampling_info(self, bs: int, num_extends: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
+            extend_lengths=(
+                self.input_buffers.input_lengths_buf[:num_extends]
+                if num_extends
+                else None
+            ),
             draft_probs=self.runtime_states.draft_probs,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
@@ -1898,8 +1884,8 @@ class ModelExecutor:
                     batch_size=padded_bs,
                     total_tokens=padded_bs * self.config.output_length,
                 )
-                # Captured hostfunc pops one entry per replay; push a dummy
-                # for this idle replay, same as run_once.
+                # Captured hostfunc pops one gate decision per replay; add a
+                # dummy for this idle replay, same as run_once.
                 if self.capturable_grammar is not None:
                     self.capturable_grammar.add_batch(
                         grammars=[None] * padded_bs,
@@ -2421,7 +2407,7 @@ class ModelExecutor:
                     ctx.all_extend = dp_metadata.all_extend
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
-                    sampling_info = self._build_sampling_info(bs)
+                    sampling_info = self._build_sampling_info(bs, num_extends)
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
                         bs=bs,
