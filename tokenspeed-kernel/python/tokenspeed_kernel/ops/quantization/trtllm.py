@@ -134,9 +134,11 @@ if platform.is_nvidia:
             "granularity": frozenset({"token_group_128"}),
             "scale_encoding": frozenset({"float32"}),
             "scale_layout": frozenset({"mn_major"}),
-            "pdl_enabled": frozenset({False}),
         },
         features=frozenset({"mn_major_scales"}),
+        # A solution override (override="trtllm") skips trait matching and
+        # takes the solution's highest priority; the lowest band keeps it on
+        # trtllm_quantize_fp8_with_scale's contiguous scales.
         priority=Priority.REFERENCE,
     )
     def trtllm_quantize_fp8_mn_major(
