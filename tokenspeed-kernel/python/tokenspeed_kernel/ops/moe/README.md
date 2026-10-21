@@ -67,8 +67,6 @@ matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 Private cold JIT compilations bind their include path to that versioned source
 tree. FlashInfer can share mutable include-directory storage across native
 modules, so a module loaded later must not redirect private kernel compilation.
-The CPU-only cold-JIT regression test compiles with the real private compiler
-after changing the shared include directory; it never loads a GPU kernel.
 The installed FlashInfer package is unchanged. To switch settings, prepare a
 new callable, warm it up, and recapture graphs.
 
