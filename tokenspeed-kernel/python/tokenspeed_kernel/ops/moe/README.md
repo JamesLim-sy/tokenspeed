@@ -64,6 +64,9 @@ Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
 0.7.2 and compile isolated modules, operators, and tuning caches. They require
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
+Private cold JIT compilations bind their include path to that versioned source
+tree. FlashInfer can share mutable include-directory storage across native
+modules, so a module loaded later must not redirect private kernel compilation.
 The installed FlashInfer package is unchanged. To switch settings, prepare a
 new callable, warm it up, and recapture graphs.
 
@@ -89,6 +92,17 @@ metadata would exceed the shared-memory budget retain the upstream scheduler.
 Regression tests compare eager and graph outputs with upstream at
 `atol=rtol=0`. Performance depends on shape and routing; the mean hint alone
 can regress on concentrated routes, so benchmark the intended settings.
+
+Both private modes also change how the SwapAB grouped GEMM moves data, without
+changing its accumulation order. When a weight-scale row is a multiple of 16
+bytes, the TMA thread prefetches each tile's weight scales with the tile's first
+pipeline stage, so the math warps no longer load scales and synchronize at every
+tile boundary. Weight loads carry an L2 evict-first hint: weights are read once
+per call, and evicting them first keeps the GEMM from evicting, and writing
+back, data that earlier kernels left in L2, which would otherwise fill the
+pipeline gaps the prefetch removes. With prefix/lookup scheduling, each block
+reads the expert offsets once into shared memory while its barriers are set up,
+and fills the lookup table per expert instead of searching per tile.
 
 ### NVFP4 routing-map padding
 

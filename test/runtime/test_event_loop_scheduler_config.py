@@ -42,16 +42,13 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 pytest.importorskip("tokenspeed_scheduler")
 
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.engine.event_loop import (  # noqa: E402
     scheduler_config_from_args,
 )
-from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
-
-PREFETCH = dict(
-    kvstore_prefetch_min_pages=2,
-    kvstore_prefetch_timeout_base_s=1.0,
-    kvstore_prefetch_timeout_per_page_s=0.0,
-    kvstore_prefetch_batch_pages=128,
+from tokenspeed.runtime.utils.server_args import (  # noqa: E402
+    ServerArgs,
+    prepare_server_args,
 )
 
 
@@ -66,9 +63,15 @@ def _specs(*, num_host_pages: int, num_snapshot_pages: int, max_retracted: int):
 
 
 def _config(args: ServerArgs, specs):
+    storage_config = None
+    if args.kvstore_storage_backend is not None:
+        storage_config = StorageRuntimeConfig.from_extra_config(
+            None, host_blocks=specs.num_host_pages - 1, prefix_granularity=16
+        ).scheduler
     return scheduler_config_from_args(
         args,
         specs,
+        storage_config=storage_config,
         max_scheduled_tokens=args.chunked_prefill_size,
         max_batch_size=args.retraction_snapshot_max_requests or 8,
         decode_input_tokens=1,
@@ -81,25 +84,22 @@ def _config(args: ServerArgs, specs):
 def test_an_engine_without_l3_passes_no_prefetch_threshold():
     # The knob is unset (None) without a store; the binding takes 0.
     args = ServerArgs(model="x", max_num_seqs=8)
-    assert args.kvstore_prefetch_min_pages is None
     cfg = _config(
         args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
     )
     assert cfg.enable_l3_storage is False
-    assert cfg.l3_prefetch_min_pages == 0
+    assert cfg.storage_config is None
     assert cfg.disable_l2_cache is False and cfg.num_host_pages == 17
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == (5, 8)
 
 
 def test_an_engine_with_l3_passes_its_prefetch_threshold():
-    args = ServerArgs(
-        model="x", max_num_seqs=8, kvstore_storage_backend="memory", **PREFETCH
-    )
+    args = ServerArgs(model="x", max_num_seqs=8, kvstore_storage_backend="memory")
     cfg = _config(
         args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
     )
     assert cfg.enable_l3_storage is True
-    assert cfg.l3_prefetch_min_pages == 2
+    assert cfg.storage_config is not None
 
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
@@ -120,3 +120,48 @@ def test_pd_roles_configure_their_pools_as_resolved(role):
     )
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == pool
     assert cfg.debug_force_retraction_interval == (0 if role == "prefill" else 3)
+
+
+@pytest.mark.parametrize(
+    "flags, enabled",
+    [([], False), (["--enable-state-checkpoint-in-forward"], True)],
+)
+def test_the_in_forward_state_checkpoint_is_off_unless_the_flag_is_given(
+    flags, enabled
+):
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.state_checkpoint_in_forward is enabled
+
+
+def test_the_in_forward_state_checkpoint_is_refused_without_prefix_caching():
+    # Its checkpoint is only reachable through a prefix hit.
+    with pytest.raises(ValueError, match="requires prefix caching"):
+        ServerArgs(
+            model="x",
+            max_num_seqs=8,
+            disable_kvstore=True,
+            enable_prefix_caching=False,
+            enable_state_checkpoint_in_forward=True,
+        )
+
+
+def test_a_decode_server_takes_the_in_forward_state_checkpoint_flag_as_a_no_op():
+    # A decode server computes no prompt, so a PD launcher may pass the flag
+    # to both roles while disabling prefix caching only on decode; neither
+    # its scheduler nor its executor (whose prefill kernels a decode node may
+    # lack) turns the checkpoint on.
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="decode",
+        disaggregation_transfer_backend="mooncake",
+        disable_kvstore=True,
+        enable_prefix_caching=False,
+        enable_state_checkpoint_in_forward=True,
+    )
+    assert not args.writes_state_checkpoints_in_forward
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=5, max_retracted=8))
+    assert not cfg.state_checkpoint_in_forward
