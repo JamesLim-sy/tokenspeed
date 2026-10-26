@@ -59,7 +59,6 @@ from starlette.routing import Mount
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.metrics.config import metrics_enabled
-from tokenspeed.runtime.metrics.func_timer import enable_func_timer
 from tokenspeed.runtime.utils.network import (  # noqa: F401
     get_free_port,
     is_valid_ipv6_address,
@@ -345,47 +344,6 @@ def set_weight_attrs(
         if hasattr(weight, key):
             raise ValueError(f"Overwriting existing tensor attribute: {key}")
         setattr(weight, key, value)
-
-
-class PipelinedPyobjBroadcaster:
-    """Overlap empty Python-object notifications with useful work."""
-
-    def __init__(
-        self,
-        rank: int,
-        dist_group: torch.distributed.ProcessGroup | None = None,
-        src: int = 0,
-    ) -> None:
-        self.rank = rank
-        self.dist_group = dist_group
-        self.src = src
-        self._data = None
-        self._ready = torch.zeros(1, dtype=torch.long)
-        self._work = None
-
-    @property
-    def in_flight(self) -> bool:
-        return self._work is not None
-
-    def start(self, data: list[Any] | None) -> None:
-        self._data = data
-        if self.rank == self.src:
-            self._ready[0] = bool(data)
-        self._work = dist.broadcast(
-            self._ready,
-            src=self.src,
-            group=self.dist_group,
-            async_op=True,
-        )
-
-    def finish(self) -> list[Any]:
-        self._work.wait()
-        data = self._data
-        self._data = None
-        self._work = None
-        if self._ready.item():
-            return broadcast_pyobj(data, self.rank, self.dist_group, src=self.src)
-        return data or []
 
 
 def broadcast_pyobj(
@@ -726,7 +684,6 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     # Add prometheus middleware
     if enable_metrics:
         add_prometheus_middleware(app)
-        enable_func_timer()
 
     config = uvicorn.Config(
         app,
@@ -953,9 +910,14 @@ def get_colorful_logger(name):
 def _maybe_json_dict(path: str | os.PathLike) -> dict[str, str]:
     with open(path) as f:
         try:
-            return json.loads(f.read())
-        except Exception:
+            value = json.loads(f.read())
+        except json.JSONDecodeError:
             return dict[str, str]()
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        return dict[str, str]()
+    return value
 
 
 def _maybe_space_split_dict(path: str | os.PathLike) -> dict[str, str]:
@@ -972,7 +934,8 @@ def _maybe_space_split_dict(path: str | os.PathLike) -> dict[str, str]:
 
 def maybe_model_redirect(model: str) -> str:
     """
-    Use model_redirect to redirect the model name to a local folder.
+    Redirect the model name using a JSON string-to-string mapping or
+    whitespace-separated pairs. Other JSON values use the whitespace fallback.
 
     :param model: hf model name
     :return: maybe redirect to a local folder

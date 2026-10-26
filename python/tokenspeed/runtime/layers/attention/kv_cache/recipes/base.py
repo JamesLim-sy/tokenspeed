@@ -31,9 +31,6 @@ from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
 from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
 )
-from tokenspeed.runtime.layers.attention.configs.linear_attn import (
-    LinearAttnConfig,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import (
     configured_token_limit,
 )
@@ -132,6 +129,19 @@ class CacheRecipe(ABC):
         )
         self.check_layout(layout)
         specs = tuple(spec for spec, _ in groups)
+        probe_parents = None
+        if self.probe_batch_rows is not None:
+            probe_parents = max(
+                self.probe_batch_rows,
+                self.parents_needed(layout, 1),
+                sum(
+                    -(
+                        -self.probe_batch_rows
+                        // (packing * self._shard_counts[group_id])
+                    )
+                    for group_id, packing in layout.group_packing
+                ),
+            )
         policy = self.offload_policy()
         offload = (
             None
@@ -152,14 +162,10 @@ class CacheRecipe(ABC):
                     2**31 - 1,
                     parent_tokens=self._max_packing(layout) * layout.prefix_granularity,
                 ),
-                probe_lcm_blocks=(
-                    max(self.probe_batch_rows, self.parents_needed(layout, 1))
-                    if self.probe_batch_rows is not None
-                    else None
-                ),
+                probe_lcm_blocks=probe_parents,
             )
-        elif self.probe_batch_rows is not None:
-            num_lcm_blocks = max(self.probe_batch_rows, self.parents_needed(layout, 1))
+        elif probe_parents is not None:
+            num_lcm_blocks = probe_parents
         else:
             num_lcm_blocks = self.num_lcm_blocks(layout)
         memory_plan = layout.bind(num_lcm_blocks)
@@ -497,36 +503,3 @@ class CacheRecipe(ABC):
     def pool_options(self) -> object | None:
         """Family-specific options the pool constructor needs."""
         return None
-
-
-def kda_verify_scratch_in_pool(server_args, attn_config) -> bool:
-    """Raw-gate KDA replay reuses the committed conv slab as verify scratch."""
-    # A PD prefill role never verifies, so it stages no verify scratch.
-    if (
-        server_args.speculative_algorithm is None
-        or server_args.disaggregation_mode == "prefill"
-    ):
-        return False
-    from tokenspeed_kernel.ops.attention.kda import (
-        kda_batched_replay_uses_raw_gate,
-        kda_recurrent_layout,
-        kda_replay_commit_supported,
-    )
-
-    linear_attn = attn_config.component(LinearAttnConfig)
-    if linear_attn is None:
-        # No linear attention, so no conv slab for verify scratch to alias.
-        return False
-
-    heads, head_dim, _ = linear_attn.temporal_state_shape
-    return bool(
-        kda_replay_commit_supported(
-            attn_config.dtype,
-            recurrent_layout=kda_recurrent_layout(),
-            num_heads=heads,
-            head_dim=head_dim,
-        )
-        and kda_batched_replay_uses_raw_gate(
-            attn_config.dtype, num_heads=heads, head_dim=head_dim
-        )
-    )

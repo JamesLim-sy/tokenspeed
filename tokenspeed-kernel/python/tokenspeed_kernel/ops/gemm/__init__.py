@@ -54,6 +54,7 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
+    KernelPlan,
     NoKernelFoundError,
     SelectedKernel,
     resolve_kernel_override,
@@ -81,6 +82,7 @@ __all__ = [
     # GEMM
     "bmm",
     "mm",
+    "plan_dense_gemm",
     # NVFP4 x BF16 weight preparation
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "prepare_nvfp4_a16_weights",
@@ -92,6 +94,7 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
     "grouped_bf16_projection",
+    "grouped_bf16_projection_quantize_fp8",
     # MV: small-M dense projection
     "mv",
     # Linear AttnRes partials
@@ -335,7 +338,7 @@ def _online_quantize_mxfp8(
 
 def _kernel_handles_online_mxfp8(kernel_name: str) -> bool:
     spec = KernelRegistry.get().get_by_name(kernel_name)
-    return spec is not None and spec.solution == "reference"
+    return spec is not None and spec.solution == "torch"
 
 
 def _validate_gemm_out(
@@ -406,6 +409,7 @@ def prepare_mxfp8_weight_scales(
 def _mm_mxfp8_prepacked(
     A: torch.Tensor,
     B: torch.Tensor,
+    A_scales: torch.Tensor | None,
     B_scales: torch.Tensor | None,
     *,
     bias: torch.Tensor | None,
@@ -413,15 +417,30 @@ def _mm_mxfp8_prepacked(
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     n, k = B.shape
+    if not has_flashinfer_mxfp8():
+        raise ValueError(
+            "mm(prepacked_scales=True) with block_size [1, 32] requires "
+            "FlashInfer's MXFP8 GEMM"
+        )
+    quantized = A.dtype == _fp8_dtype
     if (
         A.ndim != 2
-        or A.dtype not in (torch.bfloat16, torch.float16)
+        or A.dtype not in (torch.bfloat16, torch.float16, _fp8_dtype)
         or A.shape[1] != k
         or A.stride(-1) != 1
+        or quantized != (A_scales is not None)
     ):
         raise ValueError(
             "mm(prepacked_scales=True) with block_size [1, 32] requires 16-bit "
-            "[M, K] activations with unit inner stride"
+            "[M, K] activations, or E4M3 codes with their UE8M0 scales, with "
+            "unit inner stride"
+        )
+    if quantized and (
+        A_scales.dtype != torch.uint8 or tuple(A_scales.shape) != (A.shape[0], k // 32)
+    ):
+        raise ValueError(
+            "mm(prepacked_scales=True) requires canonical [M, K/32] UE8M0 "
+            "activation scales with E4M3 codes"
         )
     if (
         B_scales is None
@@ -432,11 +451,20 @@ def _mm_mxfp8_prepacked(
             "mm(prepacked_scales=True) with block_size [1, 32] requires weight "
             "scales from prepare_mxfp8_weight_scales"
         )
+    if out is not None:
+        _validate_gemm_out(
+            out, shape=(A.shape[0], n), dtype=out_dtype, device=A.device, op="mm"
+        )
     if A.shape[0] == 0:
         return out if out is not None else A.new_empty((0, n), dtype=out_dtype)
-    # Same codes and scales as the reference 1x32 quantizer, written directly
-    # in the layout the native kernel reads.
-    values, activation_scales = _quantize_fp8_group32_swizzled(A)
+    if quantized:
+        # Pre-quantized codes keep their canonical scales; the native kernel
+        # swizzles these per call, which is small next to the weight scales.
+        values, activation_scales = A, A_scales
+    else:
+        # Same codes and scales as the reference 1x32 quantizer, written
+        # directly in the layout the native kernel reads.
+        values, activation_scales = _quantize_fp8_group32_swizzled(A)
     result = flashinfer_mm_mxfp8(
         values,
         B,
@@ -455,6 +483,38 @@ def _mm_mxfp8_prepacked(
     return result
 
 
+def plan_dense_gemm(
+    *,
+    mode: str,
+    input_size: int,
+    output_size: int,
+    dtype: torch.dtype,
+    batch_size: int | None,
+    batch_invariant: bool,
+) -> KernelPlan:
+    """Plan dense MM/BMM from model geometry, without allocating example tokens.
+
+    ``batch_size`` is the fixed head/group count for BMM, and None for MM.
+    The token dimension M remains unrestricted. Both inputs and output use dtype.
+    """
+    if mode not in ("mm", "bmm") or (mode == "bmm") != (batch_size is not None):
+        raise ValueError("Dense GEMM planning requires mm or bmm with its group count")
+    traits = {"n": output_size, "k": input_size, "out_dtype": dtype}
+    if batch_size is not None:
+        traits["batch"] = batch_size
+    return KernelPlan.select(
+        "gemm",
+        mode,
+        format_signature(a=dense_tensor_format(dtype), b=dense_tensor_format(dtype)),
+        features=frozenset({"batch_invariant"}) if batch_invariant else frozenset(),
+        static_traits=traits,
+        variable_traits=frozenset({"m"}),
+        solution=None,
+        declared_traits=frozenset(),
+        ignore_layout=False,
+    )
+
+
 def mm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -467,6 +527,7 @@ def mm(
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
     quant: str | None = None,
+    plan: KernelPlan | None = None,
     override: str | None = None,
     solution: str | None = None,
     prepacked_scales: bool = False,
@@ -499,6 +560,7 @@ def mm(
             ``"nvfp4"``, ``"nvfp4_a16"``, ``"mxfp4"``, ``"none"``.
             ``"nvfp4_a16"`` uses dense BF16 activations and prepared packed
             NVFP4 weights. If ``None``, inferred from input dtypes and scales.
+        plan: Initialization-time kernel selection; execution never reselects.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
         solution: Restrict selection to a registered implementation family.
@@ -506,8 +568,16 @@ def mm(
             is quantized here into the matching layout. With block_size
             ``[128, 128]`` they come from
             ``prepare_flashinfer_fp8_blockscale_weight_scales``; with
-            ``[1, 32]`` from ``prepare_mxfp8_weight_scales``.
+            ``[1, 32]`` from ``prepare_mxfp8_weight_scales``, and ``A`` may
+            also be E4M3 codes with canonical ``[M, K/32]`` UE8M0 ``A_scales``.
     """
+    if plan is not None and (
+        prepacked_scales
+        or quant not in (None, "none")
+        or A_scales is not None
+        or B_scales is not None
+    ):
+        raise ValueError("A dense GEMM plan cannot use online quantization")
     override = resolve_kernel_override("gemm", "mm", override)
     enable_pdl = pdl_enabled()
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
@@ -534,8 +604,21 @@ def mm(
                 "mm(prepacked_scales=True) requires quant='mxfp8' with block_size"
             )
         if list(block_size) == [1, 32]:
+            if (
+                alpha is not None
+                or solution is not None
+                or override
+                not in (
+                    None,
+                    "flashinfer_mm_mxfp8",
+                )
+            ):
+                raise ValueError(
+                    "mm(prepacked_scales=True) with block_size [1, 32] runs only "
+                    "flashinfer_mm_mxfp8 and takes no alpha or solution"
+                )
             return _mm_mxfp8_prepacked(
-                A, B, B_scales, bias=bias, out=out, out_dtype=out_dtype
+                A, B, A_scales, B_scales, bias=bias, out=out, out_dtype=out_dtype
             )
         if B_scales is None or tuple(B_scales.shape) != (
             K // block_size[1],
@@ -575,7 +658,9 @@ def mm(
     # A dense layer's large-M arm reaches mm directly, while small M can
     # select mv. Expose those branches at the shared kernel boundary.
     if (
-        override is None
+        plan is None
+        and solution is None
+        and override is None
         and alpha is None
         and quant in (None, "none")
         and A_scales is None
@@ -612,34 +697,78 @@ def mm(
     block_scale_layout = (
         "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
     )
+    # Supported online FP32/UE8M0 quantizers materialize contiguous FP8 operands.
+    # Describe the layout seen by GEMM, not the original dense activation view.
+    online_contiguous_a = (
+        quant == "mxfp8"
+        and A_scales is None
+        and A.dtype in (torch.bfloat16, torch.float16)
+        and B_scales is not None
+        and block_size is not None
+        and (
+            (B_scales.dtype == torch.float32 and block_size[1] in (32, 128))
+            or (
+                B_scales.dtype == torch.uint8
+                and block_size[1] == 32
+                and A.stride(-1) == 1
+            )
+        )
+    )
     traits: dict[str, object] = {
         "m": M,
         "n": N,
         "k": K,
         "b_layout": b_layout,
-        "a_inner_stride_one": A.stride(-1) == 1,
+        "a_contiguous": online_contiguous_a or A.is_contiguous(),
+        "a_inner_stride_one": online_contiguous_a or A.stride(-1) == 1,
         "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
+        "b_contiguous": B.is_contiguous(),
         "b_inner_stride_one": B.stride(-1) == 1,
+        "b_scales_contiguous": B_scales is None or B_scales.is_contiguous(),
         "b_scales_inner_stride_one": (B_scales is None or B_scales.stride(-1) == 1),
         "block_scale_layout": block_scale_layout,
+        "has_alpha": alpha is not None,
+        "out_contiguous": out is None or out.is_contiguous(),
         "out_dtype": out_dtype,
         "out_inner_stride_one": out is None or out.stride(-1) == 1,
         "pdl_enabled": enable_pdl,
     }
+    if quant == "mxfp8" and block_size is not None and tuple(block_size) == (128, 128):
+        # Contiguous offset views can still violate a backend's pointer alignment.
+        # Online quantization allocates aligned activation values and scales.
+        traits["operands_aligned_16"] = (
+            online_contiguous_a or A.data_ptr() % 16 == 0
+        ) and B.data_ptr() % 16 == 0
+        traits["out_aligned_16"] = out is None or out.data_ptr() % 16 == 0
+        traits["scales_aligned_16"] = (
+            A_scales is None or A_scales.data_ptr() % 16 == 0
+        ) and (B_scales is None or B_scales.data_ptr() % 16 == 0)
 
     signature = _gemm_format_signature(
         A, B, A_scales, B_scales, out_dtype, quant, block_size
     )
     select_dtype = signature.storage_dtype_for("a") or A.dtype
 
-    kernel = select_kernel(
-        "gemm",
-        "mm",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
+    if plan is not None:
+        plan.validate(
+            "gemm",
+            "mm",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+            features=None,
+        )
+        kernel = plan.kernel
+    else:
+        kernel = select_kernel(
+            "gemm",
+            "mm",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
     # Online activation quantization
     if (
         quant == "mxfp8"
@@ -719,6 +848,7 @@ def bmm(
     block_size: list[int] | None = None,
     quant: str | None = None,
     enable_pdl: bool = False,
+    plan: KernelPlan | None = None,
     override: str | None = None,
 ) -> torch.Tensor:
     """Batched matrix multiply with automatic kernel selection.
@@ -751,6 +881,7 @@ def bmm(
             If ``None``, inferred from input dtypes and scales.
         enable_pdl: Whether to request Programmatic Dependent Launch support
             from kernels that accept it.
+        plan: Initialization-time kernel selection; execution never reselects.
         override: Force selection of a specific kernel by name. Bypasses
             heuristic scoring.
     """
@@ -793,13 +924,25 @@ def bmm(
     )
     select_dtype = signature.storage_dtype_for("a") or A.dtype
 
-    kernel = select_kernel(
-        "gemm",
-        "bmm",
-        signature,
-        traits=traits,
-        override=override,
-    )
+    if plan is not None:
+        plan.validate(
+            "gemm",
+            "bmm",
+            signature,
+            traits=traits,
+            override=override,
+            features=None,
+            solution=None,
+        )
+        kernel = plan.kernel
+    else:
+        kernel = select_kernel(
+            "gemm",
+            "bmm",
+            signature,
+            traits=traits,
+            override=override,
+        )
 
     if (
         quant == "mxfp8"
@@ -1444,6 +1587,54 @@ def grouped_bf16_projection(
         solution=solution,
     )
     return kernel(x, weight, out)
+
+
+def grouped_bf16_projection_quantize_fp8(
+    x: torch.Tensor, weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``grouped_bf16_projection`` flattened and quantized for an MXFP8 GEMM.
+
+    Args:
+        x: BF16 ``[tokens, groups, input_dim]`` activations (see
+            ``grouped_bf16_projection``).
+        weight: BF16 ``[groups, output_dim, input_dim]`` weights.
+
+    Returns:
+        E4M3 codes ``[tokens, groups * output_dim]`` and uint8 UE8M0 scales
+        ``[tokens, groups * output_dim / 32]`` of the BF16 projection, as
+        ``quantize_fp8(granularity="token_group", group_size=32,
+        scale_encoding="ue8m0")`` produces them. A kernel that quantizes in
+        its epilogue is used when one is registered for the geometry.
+    """
+    try:
+        kernel = select_kernel(
+            "gemm",
+            "grouped_bf16_projection_fp8",
+            format_signature(
+                x=dense_tensor_format(torch.bfloat16),
+                weight=dense_tensor_format(torch.bfloat16),
+            ),
+            traits={
+                "batch": weight.shape[0],
+                "n": weight.shape[1],
+                "k": weight.shape[2],
+                "a_inner_stride_one": x.stride(-1) == 1,
+                "b_contiguous": weight.is_contiguous(),
+                "is_cuda": x.is_cuda,
+            },
+        )
+    except NoKernelFoundError:
+        projected = grouped_bf16_projection(x, weight, None, None).flatten(1)
+        return quantize_fp8(
+            projected,
+            granularity="token_group",
+            group_size=32,
+            scale_encoding="ue8m0",
+            enable_pdl=False,
+            override=None,
+            solution=None,
+        )
+    return kernel(x, weight)
 
 
 def dsv4_linear_fp32(
@@ -3565,7 +3756,7 @@ def kimi3_router_projection(
 
 # Backend registration (side-effect imports)
 # isort: off
-import tokenspeed_kernel.numerics.reference.gemm  # noqa: E402,F401
+import tokenspeed_kernel.numerics.torch.gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.deepgemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: E402,F401
@@ -3658,6 +3849,7 @@ def fp32_router_gemv_plan(
     output_size: int,
     dtype: torch.dtype,
     solution: str | None,
+    batch_invariant: bool,
 ) -> object:
     """Select an FP32 router GEMV and its persistent weight layout.
 
@@ -3666,6 +3858,8 @@ def fp32_router_gemv_plan(
         output_size: Number of router outputs.
         dtype: Input and canonical weight dtype, which must be FP32.
         solution: Optional implementation family override.
+        batch_invariant: Require a provider declaring the ``batch_invariant``
+            feature, as bitwise numerics envelopes do.
 
     Returns:
         An opaque plan accepted by the related process and execute APIs.
@@ -3679,6 +3873,7 @@ def fp32_router_gemv_plan(
         "gemm",
         "prepared_fp32_router_gemv",
         signature,
+        features=frozenset({"batch_invariant"}) if batch_invariant else frozenset(),
         solution=solution,
     )
     spec = KernelRegistry.get().get_by_name(kernel.name)

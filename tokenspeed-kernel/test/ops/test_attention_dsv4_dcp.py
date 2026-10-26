@@ -28,10 +28,20 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsv4 import (
+    torch_dsv4_merge_partials,
+    torch_dsv4_selected_attention,
+)
+from tokenspeed_kernel.numerics.torch.kvcache import (
+    torch_virtual_slots_to_local,
+)
+from tokenspeed_kernel.ops.attention.dsa._triton import candidate_exchange as exchange
+from tokenspeed_kernel.ops.attention.dsa._triton import index_candidates as candidates
 from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_decode,
     dsv4_decode_supports_partials,
 )
+from tokenspeed_kernel.ops.attention.dsv4._triton import dcp
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
     dcp_apply_sink,
     dcp_weight_for_reduce_scatter,
@@ -43,6 +53,7 @@ from tokenspeed_kernel.ops.attention.dsv4.triton import (
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from utils import assert_no_triton_compile
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"
@@ -55,18 +66,6 @@ SWA_ROW_BYTES = SWA_TOKEN_STRIDE + 8  # plus one FP8 scale per 64-wide nope bloc
 # The arena aligns every page's stride to the token stride; SM100 FlashMLA
 # requires that alignment for its TMA loads.
 SWA_PAGE_BYTES = -(-PAGE_ROWS * SWA_ROW_BYTES // SWA_TOKEN_STRIDE) * SWA_TOKEN_STRIDE
-
-
-def _reference_translation(slots, rows, virtual_count, degree, rank):
-    """Owner and local slot of every virtual slot, straight from the contract."""
-    block = slots.clamp_min(0) // rows
-    owned = (
-        (slots >= rows)
-        & (slots < virtual_count * rows)
-        & ((block - 1) % degree == rank)
-    )
-    local = ((block - 1) // degree + 1) * rows + slots.clamp_min(0) % rows
-    return torch.where(owned, local, torch.zeros_like(local)), owned
 
 
 # ---------------------------------------------------------------------------
@@ -90,8 +89,12 @@ def test_owned_pages_partition_the_virtual_space(rows, degree, parents, packing)
             degree=degree,
             rank=rank,
         )
-        expected_local, expected_owned = _reference_translation(
-            slots, rows, virtual_count, degree, rank
+        expected_local, expected_owned = torch_virtual_slots_to_local(
+            slots,
+            rows_per_page=rows,
+            virtual_block_count=virtual_count,
+            degree=degree,
+            rank=rank,
         )
         assert torch.equal(local, expected_local)
         assert torch.equal(owned, expected_owned)
@@ -153,8 +156,8 @@ def test_virtual_slot_translation_reuses_caller_outputs():
     )
     assert local.data_ptr() == out.data_ptr()
     assert owned.data_ptr() == mask.data_ptr()
-    expected_local, expected_owned = _reference_translation(
-        slots.long().cpu(), 1, 401, 2, 1
+    expected_local, expected_owned = torch_virtual_slots_to_local(
+        slots.long().cpu(), rows_per_page=1, virtual_block_count=401, degree=2, rank=1
     )
     assert torch.equal(local.cpu().long(), expected_local)
     assert torch.equal(owned.cpu(), expected_owned)
@@ -179,26 +182,6 @@ def test_virtual_slot_translation_rejects_invalid_geometry():
 # ---------------------------------------------------------------------------
 # Partial normalization and the LSE merge
 # ---------------------------------------------------------------------------
-
-
-def _merge_reference(partials, lses, sink):
-    """Combine per-shard no-sink partials by their LSE, then apply the sink once."""
-    stacked_lse = torch.stack(lses, dim=0)  # [shards, tokens, heads]
-    finite = torch.where(
-        torch.isfinite(stacked_lse),
-        stacked_lse,
-        torch.full_like(stacked_lse, -torch.inf),
-    )
-    total = torch.logsumexp(finite, dim=0)
-    weights = torch.exp(finite - total)
-    weights = torch.nan_to_num(weights, nan=0.0)
-    merged = sum(
-        w[..., None] * p.float() for w, p in zip(weights, partials, strict=True)
-    )
-    factor = torch.where(
-        torch.isinf(total), torch.zeros_like(total), torch.sigmoid(total - sink)
-    )
-    return merged * factor[..., None], total
 
 
 @requires_cuda
@@ -255,7 +238,7 @@ def test_weight_and_sink_match_the_reference_merge_with_empty_shards(degree, dty
     lses[0][2] = torch.inf
     sink = torch.randn(heads, device="cuda")
 
-    expected, expected_lse = _merge_reference(partials, lses, sink)
+    expected, expected_lse = torch_dsv4_merge_partials(partials, lses, sink)
     all_lse = torch.stack(lses, dim=0)
     summed = None
     global_lses = []
@@ -415,17 +398,7 @@ def _page_planar_cache(pages, page_size):
 
 def _selected_attention_reference(q, kv, slots, lens, sink):
     """Softmax over each token's selected rows with the sink, plus the no-sink LSE."""
-    result = torch.zeros_like(q)
-    lse = torch.empty(q.shape[0], q.shape[1], device=q.device)
-    for token in range(q.shape[0]):
-        selected = slots[token, : int(lens[token])].long()
-        selected = selected[(selected >= 0) & (selected < kv.shape[0])]
-        keys = kv[selected].float()
-        logits = q[token].float() @ keys.T * HEAD_DIM**-0.5
-        lse[token] = torch.logsumexp(logits, dim=1) if keys.shape[0] else -torch.inf
-        probabilities = torch.cat((logits, sink[:, None]), dim=1).softmax(dim=1)[:, :-1]
-        result[token] = (probabilities @ keys).to(q.dtype)
-    return result, lse
+    return torch_dsv4_selected_attention(q, kv, slots, lens, sink, HEAD_DIM**-0.5)
 
 
 @requires_cuda
@@ -588,3 +561,208 @@ def test_masked_compress_stores_leave_every_other_byte_untouched(compress_ratio)
     # Masked tokens park on slot 0; the null page must stay untouched too.
     assert not changed_pages[0]
     assert not changed_pages[tokens + 1]
+
+
+# Candidate transport and head-owner merging share the DCP graph contract.
+
+
+@pytest.mark.parametrize("rows", [0, 1, 7])
+@pytest.mark.parametrize("degree", [1, 3, 8])
+@pytest.mark.parametrize("width,topk", [(16, 8), (2053, 2049)])
+@requires_cuda
+def test_rank_major_merge_preserves_order_and_bits(rows, degree, width, topk):
+    ids = torch.arange(degree * rows * width, device="cuda", dtype=torch.int32)
+    ids = ids.reshape(degree, rows, width) + 2**24 + 1
+    scores = torch.rand((degree, rows, width), device="cuda")
+    if rows:
+        ids[:, 0, -1] = -1
+        scores[:, 0, :4] = torch.tensor(
+            [torch.inf, -torch.inf, torch.nan, -0.0], device="cuda"
+        )
+        scores[:, -1, 4:] = -torch.inf
+    records = torch.stack((ids, scores.view(torch.int32)), dim=-1)
+    actual, counts = exchange.merge_packed_index_candidates(records, topk=topk)
+    row_ids = ids.permute(1, 0, 2).reshape(rows, degree * width)
+    row_scores = scores.permute(1, 0, 2).reshape(rows, degree * width)
+    valid = (row_ids >= 0) & ~torch.isnan(row_scores) & (row_scores > -torch.inf)
+    values, order = torch.topk(torch.where(valid, row_scores, -torch.inf), topk, dim=-1)
+    expected = torch.where(values > -torch.inf, row_ids.gather(1, order), -1)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(
+        counts, (values > -torch.inf).sum(1).int(), atol=0, rtol=0
+    )
+
+
+@requires_cuda
+def test_candidate_gather_bounds_reads_with_uninitialized_tail():
+    logits = torch.full((2, 128), torch.nan, device="cuda")
+    values = torch.tensor(
+        [[3.0, 4.0, torch.inf, torch.nan, -torch.inf]] * 2, device="cuda"
+    )
+    offsets = torch.tensor(
+        [[0, 63, 64, 1 << 29, -1]] * 2, device="cuda", dtype=torch.int32
+    )
+    positions = torch.tensor([[9, 7], [5, 3]], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([[64], [0]], device="cuda", dtype=torch.int32)
+    ids, scores = candidates.gather_index_candidates(
+        offsets,
+        logits,
+        positions,
+        64,
+        lengths=lengths,
+        selected_scores=values,
+    )
+    torch.testing.assert_close(
+        ids,
+        torch.tensor(
+            [[576, 639, -1, -1, -1], [-1] * 5], device="cuda", dtype=torch.int32
+        ),
+    )
+    torch.testing.assert_close(
+        scores,
+        torch.tensor(
+            [[3.0, 4.0, -torch.inf, -torch.inf, -torch.inf], [-torch.inf] * 5],
+            device="cuda",
+        ),
+    )
+
+
+@requires_cuda
+def test_length_aware_helpers_do_not_specialize_on_batch_geometry():
+    def run(rows, width):
+        logits = torch.randn(rows, width, device="cuda")
+        positions = torch.arange(
+            (width + 63) // 64, device="cuda", dtype=torch.int32
+        ).repeat(rows, 1)
+        lengths = torch.full((rows, 1), width, dtype=torch.int32, device="cuda")
+        candidates.mask_index_scores(
+            logits, positions, lengths, lengths.flatten(), 64, 0, 0, mask_tail=False
+        )
+        offsets = torch.arange(8, device="cuda", dtype=torch.int32).repeat(rows, 1)
+        return candidates.gather_index_candidates(
+            offsets,
+            logits,
+            positions,
+            64,
+            lengths=lengths,
+            selected_scores=logits[:, :8],
+        )
+
+    run(4, 256)
+    with assert_no_triton_compile(
+        candidates._mask_scores, candidates._gather_candidates
+    ):
+        for rows, width in ((1, 64), (3, 128), (16, 516)):
+            run(rows, width)
+
+
+def _partials(degree, tokens, dim, dtype, strided):
+    heads = degree * 2
+    outputs = torch.randn(
+        degree, tokens, heads, dim * (2 if strided else 1), device="cuda", dtype=dtype
+    )
+    if strided:
+        outputs = outputs[..., ::2]
+    lses = torch.randn(degree, tokens, heads * 2, device="cuda")[..., ::2] * 3
+    if tokens >= 5:
+        lses[0, 0] = torch.inf
+        outputs[0, 0] = torch.nan
+        lses[:, 1] = -torch.inf
+        outputs[:, 1] = torch.nan
+        lses[0, 2, 0] = torch.nan
+        if degree > 1:
+            lses[0, 3] = -1000
+            lses[1:, 3] = 1000
+            outputs[0, 3] = torch.nan
+    return outputs, lses
+
+
+def _transport_reference(outputs, lses, sink):
+    lses = torch.where(torch.isposinf(lses), -torch.inf, lses)
+    maximum = lses.max(0).values
+    safe = torch.where(torch.isneginf(maximum), 0, maximum)
+    mass = (lses - safe).exp()
+    denominator = mass.sum(0)
+    weights = mass / denominator.clamp_min(torch.finfo(torch.float32).tiny)
+    values = torch.where(torch.isneginf(lses)[..., None], 0, outputs.float())
+    result = (values * weights[..., None]).sum(0)
+    if sink is not None:
+        normalizer = torch.where(
+            denominator == 0, -torch.inf, maximum + denominator.log()
+        )
+        factor = torch.where(
+            torch.isneginf(normalizer), 0, 1 / (1 + (sink - normalizer).exp())
+        )
+        result *= factor[..., None]
+    return result
+
+
+@pytest.mark.parametrize("degree", [1, 3, 8])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "dim,strided,use_sink", [(15, True, True), (512, False, False)]
+)
+@requires_cuda
+def test_partial_transport_and_merge(degree, dtype, dim, strided, use_sink):
+    torch.manual_seed(819)
+    outputs, lses = _partials(degree, 5, dim, dtype, strided)
+    sink = torch.randn(degree * 2, device="cuda") if use_sink else None
+    sent = [
+        dcp.dispatch_dcp_attention_partials(outputs[r], lses[r], degree=degree)
+        for r in range(degree)
+    ]
+    expected = _transport_reference(outputs, lses, sink)
+    for owner in range(degree):
+        received = torch.stack([payload[owner] for payload in sent])
+        local_sink = None if sink is None else sink[owner * 2 : (owner + 1) * 2]
+        kwargs = dict(head_dim=dim, partial_dtype=dtype, sink=local_sink)
+        actual = dcp.combine_dcp_attention_partials(
+            received, output_dtype=torch.float32, **kwargs
+        )
+        torch.testing.assert_close(
+            actual,
+            expected[:, owner * 2 : (owner + 1) * 2],
+            rtol=3e-6,
+            atol=2e-6,
+            equal_nan=True,
+        )
+        rounded = dcp.combine_dcp_attention_partials(
+            received, output_dtype=dtype, **kwargs
+        )
+        torch.testing.assert_close(
+            rounded, actual.to(dtype), rtol=0, atol=0, equal_nan=True
+        )
+        assert rounded.is_contiguous()
+
+
+@requires_cuda
+def test_candidate_and_partial_fusions_do_not_recompile():
+    degree, width, topk, dim = 2, 16, 8, 16
+
+    def run(rows):
+        records = torch.zeros(
+            (degree, rows, width, 2), device="cuda", dtype=torch.int32
+        )
+        records[..., 0] = torch.arange(width, device="cuda", dtype=torch.int32)
+        records[..., 1] = torch.arange(width, device="cuda").float().view(torch.int32)
+        selected, counts = exchange.merge_packed_index_candidates(records, topk=topk)
+        outputs, lses = _partials(degree, rows, dim, torch.bfloat16, False)
+        packed = dcp.dispatch_dcp_attention_partials(outputs[0], lses[0], degree=degree)
+        merged = dcp.combine_dcp_attention_partials(
+            packed,
+            head_dim=dim,
+            partial_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+            sink=None,
+        )
+        return records, packed, selected, counts, merged
+
+    run(4)
+    with assert_no_triton_compile(
+        exchange._extract_rank_major_scores,
+        exchange._gather_selected_candidates,
+        dcp._dispatch_dcp_attention_partials,
+        dcp._combine_dcp_attention_partials,
+    ):
+        for rows in (1, 3, 16, 33):
+            run(rows)

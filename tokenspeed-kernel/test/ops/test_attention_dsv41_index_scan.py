@@ -24,13 +24,17 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from test_attention_dsv41 import _reference_quantize
 from test_attention_dsv41 import device as device
+from tokenspeed_kernel.numerics.torch.attention.dsv41 import (
+    torch_dsv41_cache_quantize,
+    torch_dsv41_gather_candidates,
+    torch_dsv41_index_cache_gather,
+    torch_dsv41_index_scores,
+)
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
 from tokenspeed_kernel.ops.attention.dsv41._deep_gemm.indexer import gather_index_pages
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
-    gather_index_cache,
     pack_index_inputs,
     pack_index_queries,
     prepare_candidate_scores,
@@ -65,18 +69,6 @@ def _inputs(device, dtype):
     table.copy_(torch.arange(127, -1, -1, device=device))
     table[:, 2:4] = torch.tensor([-1, 999999], device=device)
     return q, w, keys, cache, table, torch.zeros(3, dtype=torch.int32, device=device)
-
-
-def _oracle(q, weights, keys, shards):
-    _, q_ref = _reference_quantize(q, "index")
-    _, k_ref = _reference_quantize(keys, "index")
-    dots = torch.einsum("thd,nd->thn", q_ref.reshape(q.shape), k_ref).bfloat16()
-    products = dots.relu() * weights.cpu().unsqueeze(-1)
-    scores = torch.zeros((q.shape[0], keys.shape[0]), dtype=torch.float32)
-    # Shard sums round first; the final rank-order FP32 sum is NOT an NCCL oracle.
-    for partial in products.chunk(shards, dim=1):
-        scores += partial.sum(dim=1).float()
-    return scores.to(weights.dtype).float()
 
 
 def _check(ids, lengths, scores, rtol, atol):
@@ -256,7 +248,7 @@ def run_index_scan_graph_oracle(
     graph = None
     try:
         q, w, keys, cache, table, visible = _inputs(device, dtype)
-        physical_scores = _oracle(q, w, keys, shards)
+        physical_scores = torch_dsv41_index_scores(q, w, keys, shards)
         local_q, local_w = q.chunk(shards, dim=1)[rank], w.chunk(shards, dim=1)[rank]
         slots = torch.arange(64, device=device).expand(3, -1)
         scores = dsv41.index_score(local_q, local_w, cache, slots, group, None)
@@ -317,7 +309,7 @@ def run_index_scan_graph_oracle(
         ):
             q.add_(0.125)
             w[0].neg_()
-            physical_scores = _oracle(q, w, keys, shards)
+            physical_scores = torch_dsv41_index_scores(q, w, keys, shards)
             visible.copy_(torch.tensor(lengths, device=device))
             table.copy_(table.flip(1))
             with patch.object(
@@ -429,7 +421,7 @@ def run_index_topk_full_and_reindex(
         for actual, expected in zip(got, want, strict=True):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     else:
-        physical = _oracle(q, w, keys, 1)
+        physical = torch_dsv41_index_scores(q, w, keys, 1)
         logical = torch.arange(pages * 64)
         pages_idx = table.cpu().gather(1, logical.expand(tokens, -1) // 64).long()
         scores = physical.gather(1, pages_idx * 64 + logical % 64)
@@ -469,7 +461,7 @@ def run_index_topk_full_and_reindex(
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         else:
             logical = torch.arange(pages * 64)
-            physical = _oracle(q, w, keys, 1)
+            physical = torch_dsv41_index_scores(q, w, keys, 1)
             pages_idx = table.cpu().gather(1, logical.expand(tokens, -1) // 64).long()
             scores = physical.gather(1, pages_idx * 64 + logical % 64)
             scores.masked_fill_(
@@ -640,7 +632,7 @@ def test_index_pack_matches_independent_fp4_oracle(
     packed = torch.cat(
         (data.cpu().reshape(-1, 64), scales.cpu().view(torch.uint8).reshape(-1, 4)), 1
     )
-    expected, _ = _reference_quantize(q, "index")
+    expected, _ = torch_dsv41_cache_quantize(q, "index")
     torch.testing.assert_close(packed, expected, rtol=0, atol=0)
     torch.testing.assert_close(
         output_weights,
@@ -652,6 +644,59 @@ def test_index_pack_matches_independent_fp4_oracle(
     torch.testing.assert_close(weights, weights_before, rtol=0, atol=0)
     if weights.dtype == output_dtype and weights.is_contiguous():
         assert output_weights is weights
+
+
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+def test_index_pack_large_inner_stride(device, weight_dtype):
+    stride = 1 << 25
+    elements = 191 * stride + 1
+    required_bytes = elements * torch.bfloat16.itemsize
+    if torch.cuda.mem_get_info(device)[0] < required_bytes + (256 << 20):
+        pytest.skip("requires space for a large-stride query view")
+    storage = torch.empty(elements, dtype=torch.bfloat16, device=device)
+    # Keep wrapped int32 reads in bounds so a regression fails by value.
+    storage.as_strided((192,), (stride,)).fill_(-17)
+    q = storage.as_strided((1, 1, 128), (0, 0, stride), storage_offset=64 * stride)
+    q.copy_(torch.arange(128, dtype=torch.bfloat16, device=device).view(1, 1, 128))
+    weights = torch.ones(1, 1, dtype=weight_dtype, device=device)
+    (data, scales), output_weights = pack_index_inputs(q, weights, weight_dtype)
+    expected, _ = torch_dsv41_cache_quantize(q.contiguous(), "index")
+    packed = torch.cat(
+        (data.cpu().reshape(-1, 64), scales.cpu().view(torch.uint8).reshape(-1, 4)), 1
+    )
+    torch.testing.assert_close(packed, expected, rtol=0, atol=0)
+    assert output_weights is weights
+
+
+@pytest.mark.parametrize("width", [128, 131200])
+@pytest.mark.parametrize("rows", [1, 3])
+def test_block_select_visible_stride_contract(device, width, rows):
+    logits = torch.randn(rows, width, device=device)
+    visible = torch.full((2 * rows,), width, dtype=torch.int64, device=device)[::2]
+    out = torch.empty(rows, 4, dtype=torch.int32, device=device)
+    lengths = torch.empty(rows, dtype=torch.int32, device=device)
+    if rows > 1:
+        with pytest.raises(ValueError, match="contiguous visible row counts"):
+            implementation.index_block_select(
+                logits, visible, 4, out, lengths, visible_capacity=width
+            )
+        return
+    # A single element has no stride-dependent addressing, in either selector.
+    expected_out = torch.empty_like(out)
+    expected_lengths = torch.empty_like(lengths)
+    implementation.index_block_select(
+        logits, visible, 4, out, lengths, visible_capacity=width
+    )
+    implementation.index_block_select(
+        logits,
+        visible.clone(),
+        4,
+        expected_out,
+        expected_lengths,
+        visible_capacity=width,
+    )
+    torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(lengths, expected_lengths, rtol=0, atol=0)
 
 
 def test_index_pack_boundaries_and_graph_refresh(device):
@@ -761,32 +806,6 @@ def test_select_all_tile_slices_reuse_compilation():
     torch.testing.assert_close(out[1], lengths)
 
 
-def _candidate_reference(logits, lengths, candidates, block_size, alignment):
-    logits, lengths, candidates = (x.cpu() for x in (logits, lengths, candidates))
-    count = candidates.shape[1]
-    stride = (count * block_size + alignment - 1) // alignment * alignment
-    scores = torch.full((logits.shape[0], stride), -torch.inf)
-    normalized = torch.full(candidates.shape, -1, dtype=torch.int32)
-    ends = torch.zeros(logits.shape[0], dtype=torch.int32)
-    for row in range(logits.shape[0]):
-        end = max(0, min(int(lengths[row]), logits.shape[1]))
-        ids = sorted(
-            int(c)
-            for c in candidates[row]
-            if 0 <= c < (end + block_size - 1) // block_size
-        )
-        for i, c in enumerate(ids):
-            if i and c == ids[i - 1]:
-                continue
-            normalized[row, i] = c
-            n = min(block_size, end - c * block_size)
-            scores[row, i * block_size : i * block_size + n] = logits[
-                row, c * block_size : c * block_size + n
-            ]
-            ends[row] = i * block_size + n
-    return scores, ends, normalized
-
-
 @pytest.mark.parametrize(
     "count,block_size,alignment,sorted_ids",
     [
@@ -811,7 +830,9 @@ def test_candidate_scores_causal_duplicates_and_strides(
             candidates.masked_fill(candidates < 0, 2**31 - 1).sort().values
         )
         candidates.masked_fill_(candidates == 2**31 - 1, -1)
-    expected = _candidate_reference(logits, lengths, candidates, block_size, alignment)
+    expected = torch_dsv41_gather_candidates(
+        logits, lengths, candidates, block_size, alignment
+    )
     actual = prepare_candidate_scores(
         logits, lengths, candidates, block_size, alignment
     )
@@ -833,7 +854,7 @@ def test_candidate_scores_graph_refresh(device):
         candidates.random_(-5, 512)
         logits.normal_()
         graph.replay()
-        expected = _candidate_reference(logits, lengths, candidates, 8, 64)
+        expected = torch_dsv41_gather_candidates(logits, lengths, candidates, 8, 64)
         for got, want in zip(actual, expected, strict=True):
             torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
 
@@ -856,15 +877,6 @@ def _gather_inputs(capacity, strided, dtype):
         table[1::17] = -1
         table[2::31] = pages + 123
     return cache, table
-
-
-def _gather_reference(cache, table):
-    logical = torch.arange(table.numel() * 64, device=cache.device, dtype=torch.int64)
-    pages = table[logical // 64]
-    slots = (pages.to(torch.int64) * 64 + logical % 64).masked_fill(
-        (pages < 0) | (pages >= cache.shape[0]), -1
-    )
-    return gather_index_cache(cache, slots, 64)
 
 
 @pytest.mark.parametrize(
@@ -892,7 +904,9 @@ def test_prefill_gather_matches_slot_materialization(capacity, strided, dtype):
         else:
             cache.random_(0, 256)
         graph.replay()
-        for got, want in zip(actual, _gather_reference(cache, pages), strict=True):
+        for got, want in zip(
+            actual, torch_dsv41_index_cache_gather(cache, pages), strict=True
+        ):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 

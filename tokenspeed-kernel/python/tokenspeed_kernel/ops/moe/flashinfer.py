@@ -2497,8 +2497,8 @@ if platform.is_nvidia:
         gemm2_output, expert_weights, expanded_idx = result
         if expert_weights.dtype == torch.float32:
             # FlashInfer allocates this buffer using routing_logits.dtype, but
-            # TRT-LLM's DeepSeekV3 router writes packed BF16 values into its
-            # live prefix. Recover the BF16 view expected by the latent tail.
+            # TRT-LLM's in-kernel routers write packed BF16 values into its
+            # live prefix. Recover the BF16 view deferred consumers expect.
             num_tokens, top_k = expert_weights.shape
             expert_weights = expert_weights.view(torch.bfloat16).view(-1, top_k)[
                 :num_tokens
@@ -3933,7 +3933,7 @@ if platform.is_nvidia:
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 3),
+            max_arch_version=ArchVersion(10, 7),
         ),
         signatures=format_signatures(
             "x",
@@ -3989,7 +3989,7 @@ if platform.is_nvidia:
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 3),
+            max_arch_version=ArchVersion(10, 7),
         ),
         signatures=format_signatures(
             "x",

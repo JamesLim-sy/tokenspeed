@@ -30,7 +30,11 @@ the results against a reference or against an equivalent narrower launch.
 import pytest
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.attention.dsa import (
+    torch_dsa_compact_index_pages,
+)
 from utils import (
+    assert_fp8_same_or_adjacent_at_midpoint,
     assert_no_triton_compile,
     int_specialization_class,
     warm_specialization_classes,
@@ -223,23 +227,69 @@ def test_mxfp4_mm_row_count():
             torch.testing.assert_close(run(rows), full[:rows], rtol=0, atol=0)
 
 
-def _compact_reference(table, requests, causal, page):
-    rows, cols = requests.numel(), table.shape[1]
-    pages = torch.zeros(rows, cols, dtype=torch.int32)
-    positions = torch.zeros_like(pages)
-    lengths = torch.zeros(rows, 1, dtype=torch.int32)
-    for row, (req, length) in enumerate(zip(requests.tolist(), causal.tolist())):
-        if not 0 <= req < table.shape[0]:
-            continue
-        valid = [
-            col
-            for col, value in enumerate(table[req].tolist())
-            if value > 0 and col * page < length
-        ]
-        pages[row, : len(valid)] = table[req, valid].cpu()
-        positions[row, : len(valid)] = torch.tensor(valid, dtype=torch.int32)
-        lengths[row] = sum(min(page, length - col * page) for col in valid)
-    return pages, positions, lengths
+def test_fp8_token_group_quantize_row_count(monkeypatch):
+    from tokenspeed_kernel import compile_monitor
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
+    from tokenspeed_kernel.ops.quantization import triton as quantization
+
+    # Kimi K3's KDA projection quantizes 7168-wide tokens in groups of 128,
+    # whose general launch tile changes above 2 and above 255 tokens. The
+    # gfx950 specialization has its own 1/16-group boundary. One startup call
+    # compiles every tile for the selected policy.
+    x = torch.randn(4096, 7168, device=DEVICE, dtype=torch.bfloat16)
+    monkeypatch.setattr(compile_monitor, "_serving", False)
+    full_codes, full_scales = quantize_fp8(
+        x,
+        granularity="token_group",
+        group_size=128,
+        override="triton_quantize_fp8_with_scale",
+    )
+    full_reciprocal = (
+        quantization._fp8_token_group_groups_per_cta(x, 128, x.numel() // 128) == 16
+    )
+    compile_monitor.mark_serving()
+    with assert_no_triton_compile(quantization._fp8_token_group_quantize_kernel):
+        for rows, columns in (
+            (1, 128),
+            (1, 7168),
+            (2, 7168),
+            (3, 7168),
+            (4, 7168),
+            (255, 7168),
+            (256, 7168),
+            (4095, 7168),
+        ):
+            # Groups are independent: a smaller input is a slice of the full one.
+            codes, scales = quantize_fp8(
+                x[:rows, :columns],
+                granularity="token_group",
+                group_size=128,
+                override="triton_quantize_fp8_with_scale",
+            )
+            values = x[:rows, :columns]
+            reciprocal = (
+                quantization._fp8_token_group_groups_per_cta(
+                    values, 128, values.numel() // 128
+                )
+                == 16
+            )
+            expected_codes = full_codes[:rows, :columns]
+            if reciprocal == full_reciprocal:
+                torch.testing.assert_close(
+                    codes.view(torch.uint8),
+                    expected_codes.view(torch.uint8),
+                    rtol=0,
+                    atol=0,
+                )
+            else:
+                # Crossing the AMD normalization boundary can move only an
+                # FP8 midpoint to its adjacent code; scales remain exact.
+                assert_fp8_same_or_adjacent_at_midpoint(
+                    values, codes, expected_codes, scales, 128
+                )
+            torch.testing.assert_close(
+                scales, full_scales[:rows, : columns // 128], rtol=0, atol=0
+            )
 
 
 def test_dsa_index_candidates_table_width():
@@ -260,7 +310,9 @@ def test_dsa_index_candidates_table_width():
         pages, positions, lengths = ic.compact_index_pages(
             table, requests, causal, page
         )
-        want = _compact_reference(table.cpu(), requests.cpu(), causal.cpu(), page)
+        want = torch_dsa_compact_index_pages(
+            table.cpu(), requests.cpu(), causal.cpu(), page
+        )
         for got, expected in zip((pages, positions, lengths), want, strict=True):
             torch.testing.assert_close(got.cpu(), expected, rtol=0, atol=0)
 
@@ -268,7 +320,9 @@ def test_dsa_index_candidates_table_width():
         logits = torch.randn(requests.numel(), width, device=DEVICE)
         logits[0, 5] = float("nan")
         expected = logits.clone()
-        ic.mask_index_scores(logits, positions, lengths, causal, page, 3, 5)
+        ic.mask_index_scores(
+            logits, positions, lengths, causal, page, 3, 5, mask_tail=True
+        )
         col = torch.arange(width, device=DEVICE)
         valid = col[None] < lengths
         logical = positions.gather(
@@ -760,7 +814,7 @@ def test_mha_decode_and_extend_table_width():
 
 
 def test_rel_mha_decode_table_width_and_split_count():
-    from rel_mha_reference import HEAD_DIM, NUM_KV_HEADS, NUM_Q_HEADS, build_paged
+    from rel_mha_helpers import HEAD_DIM, NUM_KV_HEADS, NUM_Q_HEADS, build_paged
     from tokenspeed_kernel.ops.attention.rmha import (
         rel_mha_decode_with_kvcache,
     )
@@ -807,7 +861,7 @@ def test_rel_mha_decode_table_width_and_split_count():
 
 
 def test_rel_mha_extend_table_width():
-    from rel_mha_reference import HEAD_DIM, NUM_Q_HEADS, build_paged
+    from rel_mha_helpers import HEAD_DIM, NUM_Q_HEADS, build_paged
     from tokenspeed_kernel.ops.attention.rmha import rel_mha_extend_with_kvcache
     from tokenspeed_kernel.ops.attention.rmha import triton as rmha
 
@@ -954,7 +1008,7 @@ def test_compact_kvp_pages_table_width():
 
 
 def test_mhc_mixes_split_count():
-    from test_mhc_prefill import _reference
+    from tokenspeed_kernel.numerics.torch.residual import torch_mhc_pre
     from tokenspeed_kernel.ops.residual import triton as residual
 
     hidden = 4096
@@ -968,7 +1022,7 @@ def test_mhc_mixes_split_count():
     def run(tokens):
         args = (x[:tokens], fn, scale, base, 1e-6, 1e-5, 3)
         pre, post, comb = residual.triton_mhc_mixes(*args)
-        _, post_ref, comb_ref = _reference(*args)
+        _, post_ref, comb_ref = torch_mhc_pre(*args, None, None)
         torch.testing.assert_close(post, post_ref.squeeze(-1), rtol=1e-3, atol=1e-3)
         torch.testing.assert_close(comb, comb_ref, rtol=1e-3, atol=1e-3)
         return pre
@@ -1027,7 +1081,7 @@ def test_mhc_split_count_rounds_the_sm_fill_before_the_k_cap(
 
 
 def test_mhc_pre_split_count():
-    from test_mhc_prefill import _reference
+    from tokenspeed_kernel.numerics.torch.residual import torch_mhc_pre
     from tokenspeed_kernel.ops.residual import triton as residual
 
     hidden = 4096
@@ -1041,7 +1095,7 @@ def test_mhc_pre_split_count():
         # Up to 256 tokens take the split-K GEMM and the four-stream mix kernel.
         args = (x[:tokens], fn, scale, base, 1e-6, 1e-5, 3)
         actual = residual.triton_mhc_pre(*args, norm_weight=None, norm_eps=None)
-        for got, want in zip(actual, _reference(*args), strict=True):
+        for got, want in zip(actual, torch_mhc_pre(*args, None, None), strict=True):
             torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=2e-2)
 
     def key(tokens):

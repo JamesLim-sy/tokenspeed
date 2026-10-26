@@ -55,7 +55,6 @@ from tokenspeed.runtime.configs import (
     KimiK25Config,
     MiniMaxM3Config,
     MuseSparkConfig,
-    Qwen2Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
@@ -80,7 +79,6 @@ logger = logging.getLogger(__name__)
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     BeamConfig.model_type: BeamConfig,
     Dots3NoteConfig.model_type: Dots3NoteConfig,
-    Qwen2Config.model_type: Qwen2Config,
     Qwen3Config.model_type: Qwen3Config,
     Qwen3MoeConfig.model_type: Qwen3MoeConfig,
     Qwen3ASRConfig.model_type: Qwen3ASRConfig,
@@ -103,6 +101,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     NemotronHConfig.model_type: NemotronHConfig,
     NemotronHOmniConfig.model_type: NemotronHOmniConfig,
     MuseSparkConfig.model_type: MuseSparkConfig,
+    "nemotron_h_omni": NemotronHOmniConfig,
     "glm5_next": Glm53FlashConfig,
 }
 
@@ -540,6 +539,8 @@ def get_config(
         "Qwen3ASRConfig",
         "MiniMaxM3SparseForConditionalGeneration",
         "NemotronH_Nano_Omni_Reasoning_V3",
+        "NemotronH_Omni_Reasoning_V3",
+        "NemotronH_Omni_Reasoning_V3NextN",
         "NemotronHOmniConfig",
     ]:
         if config is text_config:

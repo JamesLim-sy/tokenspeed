@@ -289,6 +289,8 @@ _HYBRID_MAMBA2_ARCHITECTURES = {
     "NemotronHForCausalLM",
     "NemotronHForCausalLMNextN",
     "NemotronH_Nano_Omni_Reasoning_V3",
+    "NemotronH_Omni_Reasoning_V3",
+    "NemotronH_Omni_Reasoning_V3NextN",
 }
 # Hybrid linear-attention models whose full-attention layers are MLA (not MHA)
 # and whose linear layers are KDA (per-channel gated delta rule), not GDN.
@@ -1236,8 +1238,13 @@ def create_attn_components(
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
     )
-    if config.kvp_size > 1 and (
-        model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
+    if (
+        config.kvp_size > 1
+        # V4.1 validates KVP in its config and specialized recipe.
+        and softmax_attn.backend_name != "deepseek_v41"
+        and (
+            model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
+        )
     ):
         _validate_mla_dcp_backend(
             target_full_attn_backend_name, model_config.attention_arch

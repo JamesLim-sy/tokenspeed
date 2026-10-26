@@ -854,31 +854,31 @@ def gluon_mhc_post_gfx950(
     r1 = cdna4.buffer_load(residual, base + HIDDEN_SIZE, mask=mask).to(gl.float32)
     r2 = cdna4.buffer_load(residual, base + 2 * HIDDEN_SIZE, mask=mask).to(gl.float32)
     r3 = cdna4.buffer_load(residual, base + 3 * HIDDEN_SIZE, mask=mask).to(gl.float32)
-    # Same accumulation order as the portable kernel: post * x first, then
-    # input streams 0..3; comb is indexed [input stream, output stream].
+    # Match portable FP32 rounding: post * x, then FMA for input streams 0..3.
+    # comb is indexed [input stream, output stream].
     out0 = p0 * x
-    out0 += c0 * r0
-    out0 += c4 * r1
-    out0 += c8 * r2
-    out0 += c12 * r3
+    out0 = gl.fma(c0, r0, out0)
+    out0 = gl.fma(c4, r1, out0)
+    out0 = gl.fma(c8, r2, out0)
+    out0 = gl.fma(c12, r3, out0)
     cdna4.buffer_store(out0.to(gl.bfloat16), out, base, mask=mask)
     out1 = p1 * x
-    out1 += c1 * r0
-    out1 += c5 * r1
-    out1 += c9 * r2
-    out1 += c13 * r3
+    out1 = gl.fma(c1, r0, out1)
+    out1 = gl.fma(c5, r1, out1)
+    out1 = gl.fma(c9, r2, out1)
+    out1 = gl.fma(c13, r3, out1)
     cdna4.buffer_store(out1.to(gl.bfloat16), out, base + HIDDEN_SIZE, mask=mask)
     out2 = p2 * x
-    out2 += c2 * r0
-    out2 += c6 * r1
-    out2 += c10 * r2
-    out2 += c14 * r3
+    out2 = gl.fma(c2, r0, out2)
+    out2 = gl.fma(c6, r1, out2)
+    out2 = gl.fma(c10, r2, out2)
+    out2 = gl.fma(c14, r3, out2)
     cdna4.buffer_store(out2.to(gl.bfloat16), out, base + 2 * HIDDEN_SIZE, mask=mask)
     out3 = p3 * x
-    out3 += c3 * r0
-    out3 += c7 * r1
-    out3 += c11 * r2
-    out3 += c15 * r3
+    out3 = gl.fma(c3, r0, out3)
+    out3 = gl.fma(c7, r1, out3)
+    out3 = gl.fma(c11, r2, out3)
+    out3 = gl.fma(c15, r3, out3)
     cdna4.buffer_store(out3.to(gl.bfloat16), out, base + 3 * HIDDEN_SIZE, mask=mask)
 
 
@@ -943,11 +943,14 @@ def gluon_mhc_apply_pre_gfx950(
     residual,
     norm_weight,
     out,
+    codes,
+    scales,
     num_tokens,
     HIDDEN_SIZE: gl.constexpr,
     BLOCK_H: gl.constexpr,
     NORM: gl.constexpr,
     EPS: gl.constexpr,
+    QUANT: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
     # One token per CTA so the optional RMSNorm reduces in one pass; every
@@ -973,15 +976,36 @@ def gluon_mhc_apply_pre_gfx950(
         weight = cdna4.buffer_load(norm_weight, hidden, mask=mask).to(gl.float32)
         values = (normed * scale * weight).to(gl.bfloat16)
     cdna4.buffer_store(values, out, token * HIDDEN_SIZE + hidden, mask=mask)
+    if QUANT:
+        # Group-32 E4M3 codes with UE8M0 scales of the BF16 output, rounded
+        # like gluon_quantize_fp8_group32_ue8m0_gfx950. Each lane's eight
+        # values stay in registers; the group max reduces over four lanes.
+        groups = gl.reshape(values.to(gl.float32), [BLOCK_H // 32, 32])
+        amax = gl.maximum(gl.max(gl.abs(groups), 1), 1.0e-4)
+        bits = (amax * (1.0 / 448.0)).to(gl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(gl.int32)
+        inverse = 1.0 / (exponent << 23).to(gl.float32, bitcast=True)
+        quantized = (groups * inverse[:, None]).to(gl.float8e4nv)
+        quantized = gl.convert_layout(gl.reshape(quantized, [BLOCK_H]), layout)
+        cdna4.buffer_store(quantized, codes, token * HIDDEN_SIZE + hidden, mask=mask)
+        group = gl.arange(
+            0, BLOCK_H // 32, layout=gl.SliceLayout(1, groups.type.layout)
+        )
+        cdna4.buffer_store(
+            exponent.to(gl.uint8),
+            scales,
+            token * (HIDDEN_SIZE // 32) + group,
+            mask=group < HIDDEN_SIZE // 32,
+        )
 
 
 def launch_gluon_mhc_apply_pre_gfx950(
     residual: torch.Tensor,
     pre_mix: torch.Tensor,
-    *,
     norm_weight: torch.Tensor | None,
     norm_eps: float | None,
-) -> torch.Tensor:
+    quantize: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Mix four BF16 streams with ``pre_mix``, optionally followed by RMSNorm.
 
     Args:
@@ -989,9 +1013,13 @@ def launch_gluon_mhc_apply_pre_gfx950(
         pre_mix: FP32 coefficients ``[..., 4]``.
         norm_weight: Optional BF16 or FP32 RMSNorm weight ``[hidden_size]``.
         norm_eps: RMSNorm epsilon, given together with ``norm_weight``.
+        quantize: Also return group-32 E4M3 codes ``[tokens, hidden_size]``
+            and uint8 UE8M0 scales ``[tokens, hidden_size // 32]`` of the
+            output.
 
     Returns:
-        BF16 layer input ``[..., hidden_size]``.
+        BF16 layer input ``[..., hidden_size]``, plus codes and scales when
+        ``quantize`` is set.
     """
     if (norm_weight is None) != (norm_eps is None):
         raise ValueError("norm_weight and norm_eps must be provided together")
@@ -1005,8 +1033,20 @@ def launch_gluon_mhc_apply_pre_gfx950(
         raise ValueError("GFX950 mHC apply-pre tensors must be contiguous")
     if residual.numel() >= 2**31:
         raise ValueError("GFX950 mHC apply-pre exceeds 32-bit buffer offsets")
+    if quantize and hidden_size % 32:
+        raise ValueError(
+            "GFX950 mHC apply-pre quantization needs hidden_size % 32 == 0"
+        )
     out = residual.new_empty((*residual.shape[:-2], hidden_size))
     num_tokens = residual.numel() // (4 * hidden_size)
+    codes = scales = out
+    if quantize:
+        codes = torch.empty(
+            (num_tokens, hidden_size), dtype=torch.float8_e4m3fn, device=out.device
+        )
+        scales = torch.empty(
+            (num_tokens, hidden_size // 32), dtype=torch.uint8, device=out.device
+        )
     if num_tokens:
         norm = norm_weight is not None
         gluon_mhc_apply_pre_gfx950[(num_tokens,)](
@@ -1014,18 +1054,21 @@ def launch_gluon_mhc_apply_pre_gfx950(
             residual,
             norm_weight if norm else out,
             out,
+            codes,
+            scales,
             num_tokens,
             HIDDEN_SIZE=hidden_size,
             BLOCK_H=triton.next_power_of_2(hidden_size),
             NORM=norm,
             EPS=norm_eps if norm else 0.0,
+            QUANT=quantize,
             NUM_WARPS=4,
             num_warps=4,
             # Match the portable kernels' rounding: the plain collapse rounds
             # each product (no FMA), the normalized one contracts to FMA.
             enable_fp_fusion=norm,
         )
-    return out
+    return (out, codes, scales) if quantize else out
 
 
 # ===-----------------------------------------------------------------------===#

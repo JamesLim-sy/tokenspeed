@@ -45,7 +45,7 @@ from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, register_kern
 
 @pytest.mark.parametrize("batched", [False, True])
 def test_registered_compute_costs(batched):
-    from tokenspeed_kernel.numerics.reference.gemm import torch_bmm, torch_mm
+    from tokenspeed_kernel.numerics.torch.gemm import torch_bmm, torch_mm
 
     batch = (2,) if batched else ()
     a, b = torch.randn(*batch, 3, 5), torch.randn(*batch, 4, 5)

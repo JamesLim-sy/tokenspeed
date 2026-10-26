@@ -22,14 +22,14 @@
 
 Exercises the full in-repo chain -- the weight preprocessor (concatenated
 [gate|up] loader layout -> shuffled TRTLLM [up|gate]) and the registered
-apply -- against ``mxfp4_moe_reference`` on the same MXFP4 weights.
+apply -- against ``mxfp4_situ_moe_experts`` on the same MXFP4 weights.
 """
 
 from __future__ import annotations
 
 import pytest
 import torch
-from kimi3_reference import mxfp4_moe_reference
+from tokenspeed_kernel.numerics.torch.moe import mxfp4_situ_moe_experts
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
@@ -126,7 +126,7 @@ def test_flashinfer_situ_kernel_routing_matches_portable_reference() -> None:
     raw, hidden_states, router_logits, bias, topk_ids, topk_weights = (
         _kernel_routing_case(20260825, num_tokens)
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -158,7 +158,7 @@ def test_flashinfer_situ_precomputed_routing_matches_portable_reference() -> Non
     raw, hidden_states, router_logits, bias, topk_ids, topk_weights = (
         _kernel_routing_case(20260827, 16)
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -253,6 +253,7 @@ def test_swiglu_deferred_finalize(num_tokens, precomputed, monkeypatch) -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["supports_deferred_finalize"]
     assert plan["topk_weights_dtype"] == torch.bfloat16
@@ -378,6 +379,7 @@ def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_mxfp4_situ_moe_apply"
     assert plan["support_routing"] is True
@@ -404,6 +406,7 @@ def test_swiglu_quantizer_keeps_native_padding(monkeypatch) -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     kernel_moe_process_weights(plan, w)
     original_hidden = HIDDEN - 32
@@ -472,6 +475,7 @@ def test_situ_dispatch_autotune_preserves_normal_output(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
         fp8_scale_block_shape=None,
         internal_activation_dtype="fp8",
         with_bias=False,

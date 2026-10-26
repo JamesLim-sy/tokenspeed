@@ -42,7 +42,7 @@ from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 def test_compute_type_uses_gpu_operands_not_output_dtype():
     if not torch.cuda.is_available():
         pytest.skip("Requires CUDA")
-    from tokenspeed_kernel.numerics.reference.gemm import torch_bmm, torch_mm
+    from tokenspeed_kernel.numerics.torch.gemm import torch_bmm, torch_mm
 
     def dense(a, b):
         return (a @ b).double()
@@ -124,7 +124,7 @@ def test_native_ranges_preserve_thread_nesting_and_gpu_projection(tmp_path):
         import sys
         from pathlib import Path
         import torch
-        from tokenspeed_kernel.numerics.reference.gemm import torch_mm
+        from tokenspeed_kernel.numerics.torch.gemm import torch_mm
         from tokenspeed_kernel.op_profile import CostRegistry, ProfileSession, profiled
         from tokenspeed_kernel.profile_costs import register_compute_costs
         from tokenspeed_kernel.profile_nvtx import NvtxTimeline

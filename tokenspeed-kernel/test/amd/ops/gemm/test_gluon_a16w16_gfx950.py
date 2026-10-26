@@ -24,6 +24,7 @@ import contextlib
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.gemm import torch_mm
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -33,7 +34,7 @@ if not is_cdna4():
     )
 
 
-from tokenspeed_kernel.ops.gemm import kimi3_router_projection  # noqa: E402
+from tokenspeed_kernel.ops.gemm import kimi3_router_projection, mm  # noqa: E402
 from tokenspeed_kernel.workspace import capture_session, zeroed_state  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     launch_gluon_mm_a16w16_prefill_gfx950,
@@ -321,9 +322,8 @@ def _decode(a, b, out_dtype, out=None):
 
 
 def _decode_reference(a, b, out_dtype):
-    if out_dtype == torch.float32:
-        return a.float() @ b.float().T
-    return torch.mm(a, b.T)
+    # The product in the output dtype: FP32 accumulates FP32 copies.
+    return torch_mm(a.to(out_dtype), b.to(out_dtype), None, None, out_dtype)
 
 
 @pytest.mark.parametrize("shape,out_dtype", _DECODE_CASES)
@@ -518,6 +518,24 @@ def test_qwen38_decode_row_count_does_not_recompile() -> None:
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
         for rows in (2, 6, 7, 12, 14, 20, 27, 40, 48, 61):
             run(rows)
+
+
+# A long-N decode projection and a split-K long-K one, at ragged rows.
+_DECODE_SHAPES = [(8192, 1024), (512, 8192)]
+
+
+@pytest.mark.parametrize("n,k", _DECODE_SHAPES)
+@pytest.mark.parametrize("m", [2, 3, 7, 16])
+def test_decode_gemm_is_selected_and_matches_reference(m: int, n: int, k: int) -> None:
+    torch.manual_seed(0)
+    assert supports_gluon_mm_a16w16_decode_gfx950(m, n, k)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    for _ in range(2):
+        a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+        out = _decode(a, b, torch.bfloat16)
+        torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
+        # gemm.mm hands the rows to the same kernel.
+        assert torch.equal(mm(a, b), out)
 
 
 def test_medium_coalesced_store_masks_strided_out() -> None:
