@@ -27,7 +27,6 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 from tokenspeed_kernel.profile_costs import CollectiveTraffic
 
@@ -259,8 +258,10 @@ def analyze_utilization(
         def percentage(value: float | None) -> str:
             return "N/A" if value is None else f"{100 * value:.2f}%"
 
-        label = record["trace_label"].split(" | ts.profile/", 1)[0]
-        label += f" | model={quote(report['model_id'], safe='._')}"
+        # Keep full model identifiers in metadata so paths do not hide metrics.
+        label, call = (
+            record["trace_label"].split(" | ts.profile/", 1)[0].rsplit(" | ", 1)
+        )
         collective_only = (
             metrics["collective_count"] > 0
             and metrics["collective_count"] == metrics["op_count"]
@@ -276,6 +277,7 @@ def analyze_utilization(
             label += f" busbw={display}"
         if kind == "layer":
             label += " (recorded ops only)"
+        label += f" | {call}"
         rows.append(
             {
                 "kind": kind,
