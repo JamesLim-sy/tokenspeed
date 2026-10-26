@@ -29,6 +29,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
@@ -256,23 +257,29 @@ def test_qwen_shared_expert_native_timeline(tmp_path):
         timeout=120,
     )
     with (root / "projection_nvtx_gpu_proj_trace.csv").open() as source:
-        projected = {
-            row["Name"].split(":", 1)[-1]: row for row in csv.DictReader(source)
-        }
+        projected = defaultdict(list)
+        for row in csv.DictReader(source):
+            projected[row["Name"].split(":", 1)[-1]].append(row)
+    labels = {row["nvtx_label"] for row in rows}
     with sqlite3.connect(f"file:{root / 'timeline.sqlite'}?mode=ro", uri=True) as db:
-        events = db.execute(
-            "SELECT eventType,globalTid FROM NVTX_EVENTS WHERE text LIKE '%MFU=%'"
-        ).fetchall()
+        events = [
+            event
+            for event in db.execute("SELECT eventType,globalTid,text FROM NVTX_EVENTS")
+            if event[2] in labels
+        ]
     assert len(events) == 12
     assert {event[0] for event in events} == {59}
     assert {event[1] % (1 << 24) for event in events} == {
         report["device_analysis"]["thread_id"]
     }
     for row in rows:
-        native = projected[row["nvtx_label"]]
+        native = projected[row["nvtx_label"]].pop(0)
         assert int(native["TID"]) == report["device_analysis"]["thread_id"]
         assert int(native["NumGPUOps"]) >= (1 if row["kind"] == "op" else 3)
-        assert "Est.MBU=" in native["Name"] and "MFU=" in native["Name"]
+        if row["kind"] == "op":
+            assert "Est.MBU=" in native["Name"] and "MFU=" in native["Name"]
+        else:
+            assert row["nvtx_label"] == f"L{row['layer_id']}"
 
 
 if __name__ == "__main__":

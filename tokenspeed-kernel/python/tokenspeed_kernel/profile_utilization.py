@@ -258,26 +258,23 @@ def analyze_utilization(
         def percentage(value: float | None) -> str:
             return "N/A" if value is None else f"{100 * value:.2f}%"
 
-        # Keep full model identifiers in metadata so paths do not hide metrics.
-        label, call = (
-            record["trace_label"].split(" | ts.profile/", 1)[0].rsplit(" | ", 1)
-        )
+        # Layer ranges organize the timeline; full identities and aggregate
+        # metrics remain in metadata. Only op ranges display utilization.
+        label = f"L{record['layer_id']}" if kind == "layer" else record["op_name"]
         collective_only = (
             metrics["collective_count"] > 0
             and metrics["collective_count"] == metrics["op_count"]
         )
-        if collective_only:
-            label += f" | Est.MBU={percentage(metrics['estimated_mbu'])}"
-        else:
-            label += f" | MFU={percentage(metrics['mfu'])}"
-            label += f" Est.MBU={percentage(metrics['estimated_mbu'])}"
-        if metrics["collective_count"] and not collective_only:
-            busbw = metrics["busbw_bytes_per_second"]
-            display = "N/A" if busbw is None else f"{busbw / 1e9:.2f} GB/s"
-            label += f" busbw={display}"
-        if kind == "layer":
-            label += " (recorded ops only)"
-        label += f" | {call}"
+        if kind == "op":
+            if collective_only:
+                label += f" | Est.MBU={percentage(metrics['estimated_mbu'])}"
+            else:
+                label += f" | MFU={percentage(metrics['mfu'])}"
+                label += f" Est.MBU={percentage(metrics['estimated_mbu'])}"
+            if metrics["collective_count"] and not collective_only:
+                busbw = metrics["busbw_bytes_per_second"]
+                display = "N/A" if busbw is None else f"{busbw / 1e9:.2f} GB/s"
+                label += f" busbw={display}"
         rows.append(
             {
                 "kind": kind,

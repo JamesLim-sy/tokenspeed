@@ -175,13 +175,16 @@ with NvtxTimeline(
 Example NVTX label:
 
 ```text
-layer=7 | op=gemm.mm | rank=0 iter=0 call=0 | MFU=31.36% Est.MBU=2.58%
+gemm.mm | MFU=31.36% Est.MBU=2.58%
 ```
 
-The labels and JSON consume the same analysis results. Layer costs sum unique
-descendant ops, while each repeated layer call uses its own measured window.
-Layer labels explicitly say "recorded ops only": coverage is of opted-in calls,
-not proof that every operation in a model was recorded. Missing costs, timing or
+Layer ranges show only their index, such as `L7`. Op labels show the op name
+and utilization; model, rank, iteration and call identities remain in the JSON.
+Labels are not unique identifiers: repeated calls and ranks can share a label.
+Use the execution thread and time range to distinguish them in a native report.
+The labels and JSON consume the same analysis results. Layer costs in the JSON
+sum unique descendant ops over each call's own measured window. Their coverage
+is limited to opted-in calls, not every operation in a model. Missing costs, timing or
 compatible peaks produce `N/A` with reasons in JSON. Mixed compute types report
 per-type fractions and no overall MFU. Ratios are not clamped to 100%.
 

@@ -166,7 +166,10 @@ def test_missing_cost_is_unavailable_and_has_reason(fixture):
         assert row["mfu"] is None and row["estimated_mbu"] is None
         assert row["covered_op_count"] == 0
         assert "cost rule unavailable" in row["mfu_missing_reason"]
-        assert "MFU=N/A Est.MBU=N/A" in row["nvtx_label"]
+        if row["kind"] == "op":
+            assert "MFU=N/A Est.MBU=N/A" in row["nvtx_label"]
+        else:
+            assert row["nvtx_label"] == f"L{row['layer_id']}"
 
 
 def test_missing_peaks_and_hbm_estimates_are_independent(fixture):

@@ -25,6 +25,7 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
@@ -201,17 +202,26 @@ def test_native_ranges_preserve_thread_nesting_and_gpu_projection(tmp_path):
         timeout=120,
     )
     with (output / "projection_nvtx_gpu_proj_trace.csv").open() as source:
-        projected = {r["Name"].split(":", 1)[-1]: r for r in csv.DictReader(source)}
+        projected = defaultdict(list)
+        for r in csv.DictReader(source):
+            projected[(int(r["TID"]), r["Name"].split(":", 1)[-1])].append(r)
+    labels = {row["nvtx_label"] for row in rows}
     with sqlite3.connect(f"file:{output / 'timeline.sqlite'}?mode=ro", uri=True) as db:
-        events = db.execute(
-            "SELECT start,end,eventType,globalTid,text FROM NVTX_EVENTS WHERE text LIKE '%MFU=%'"
-        ).fetchall()
+        events = [
+            event
+            for event in db.execute(
+                "SELECT start,end,eventType,globalTid,text FROM NVTX_EVENTS"
+            )
+            if event[4] in labels
+        ]
     assert len(events) == 6  # finish must not duplicate ranges.
     assert {e[2] for e in events} == {59}  # Actual thread NVTX push/pop ranges.
     assert len({e[3] for e in events}) == 1
     assert events[0][3] % (1 << 24) == report["device_analysis"]["thread_id"]
     for row in rows:
-        projection_row = projected[row["nvtx_label"]]
+        projection_row = projected[
+            (report["device_analysis"]["thread_id"], row["nvtx_label"])
+        ].pop(0)
         assert int(projection_row["NumGPUOps"]) == (1 if row["kind"] == "op" else 2)
         assert int(projection_row["Lvl"]) == (1 if row["kind"] == "op" else 0)
         assert int(projection_row["TID"]) == report["device_analysis"]["thread_id"]
@@ -219,7 +229,10 @@ def test_native_ranges_preserve_thread_nesting_and_gpu_projection(tmp_path):
         assert row["mfu"] == pytest.approx(
             cost / (1e12 * row["gpu_duration_ns"] * 1e-9)
         )
-        assert f"MFU={100 * row['mfu']:.2f}%" in projection_row["Name"]
+        if row["kind"] == "op":
+            assert f"MFU={100 * row['mfu']:.2f}%" in projection_row["Name"]
+        else:
+            assert row["nvtx_label"] == f"L{row['layer_id']}"
 
 
 def test_finalize_once_and_recover_after_workload_exception(tmp_path):
@@ -461,7 +474,10 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
         timeout=120,
     )
     with (tmp_path / "projection_nvtx_gpu_proj_trace.csv").open() as source:
-        projected = {r["Name"].split(":", 1)[-1]: r for r in csv.DictReader(source)}
+        projected = defaultdict(list)
+        for r in csv.DictReader(source):
+            projected[(int(r["TID"]), r["Name"].split(":", 1)[-1])].append(r)
+    labels = set()
     for rank in range(2):
         report = json.loads((tmp_path / f"metrics.rank{rank}.json").read_text())
         scopes = report["device_analysis"]["scopes"]
@@ -475,18 +491,23 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
             )
             assert row["mfu"] is None and row["estimated_mbu"] is None
             label = row["nvtx_label"]
-            assert "Est.MBU=N/A" in label
+            labels.add(label)
+            if row["kind"] == "op":
+                assert "Est.MBU=N/A" in label
+            else:
+                assert label == f"L{row['layer_id']}"
             assert "MFU=" not in label and "busbw=" not in label
-            assert (
-                int(projected[label]["TID"]) == report["device_analysis"]["thread_id"]
-            )
-            assert int(projected[label]["NumGPUOps"]) >= 1
+            native = projected[(report["device_analysis"]["thread_id"], label)].pop(0)
+            assert int(native["TID"]) == report["device_analysis"]["thread_id"]
+            assert int(native["NumGPUOps"]) >= 1
     with sqlite3.connect(
         f"file:{tmp_path / 'collectives.sqlite'}?mode=ro", uri=True
     ) as db:
-        events = db.execute(
-            "SELECT eventType, globalTid FROM NVTX_EVENTS WHERE text LIKE '%Est.MBU=%'"
-        ).fetchall()
+        events = [
+            event
+            for event in db.execute("SELECT eventType,globalTid,text FROM NVTX_EVENTS")
+            if event[2] in labels
+        ]
     assert len(events) == 8
     assert {event[0] for event in events} == {59}
     assert len({event[1] for event in events}) == 2
