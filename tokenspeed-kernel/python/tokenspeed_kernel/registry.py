@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.op_profile import OpProfile
     from tokenspeed_kernel.selection import SelectedKernel
 
+from tokenspeed_kernel.op_profile import wrap_op_for_profiling
 from tokenspeed_kernel.platform import CapabilityRequirement, PlatformInfo
 from tokenspeed_kernel.signature import FormatSignature
 
@@ -281,8 +282,17 @@ class KernelRegistry:
 
     # ---- Registration ----
 
-    def register(self, spec: KernelSpec, impl: Callable) -> None:
-        """Register a kernel specification and its implementation."""
+    def register(
+        self, spec: KernelSpec, impl: Callable, *, profile: OpProfile | None = None
+    ) -> None:
+        """Register a kernel specification and its implementation.
+
+        profile optionally enables op metadata collection for a synchronous
+        function. Omission stores impl unchanged. Retrieve the registered
+        callable through get_impl; registration returns None.
+        """
+        if profile is not None:
+            impl = wrap_op_for_profiling(impl, spec=spec, profile=profile)
         if spec.name in self._by_name:
             # Allow re-registration (plugin override)
             self._unregister(spec.name)
@@ -458,14 +468,11 @@ def register_kernel(
             weight_preprocessor=normalized_weight_preprocessor,
         )
 
-        if profile is not None:
-            from tokenspeed_kernel.op_profile import wrap_registered_op
-
-            impl = wrap_registered_op(
-                impl, family=family, mode=mode, name=kernel_name, profile=profile
-            )
-        KernelRegistry.get().register(spec, impl)
-        return impl
+        registry = KernelRegistry.get()
+        registry.register(spec, impl, profile=profile)
+        registered = registry.get_impl(kernel_name)
+        assert registered is not None
+        return registered
 
     return decorator
 

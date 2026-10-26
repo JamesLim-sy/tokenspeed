@@ -24,6 +24,7 @@ import math
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.op_profile import OpProfile
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
@@ -270,6 +271,7 @@ def torch_mm_fp8_scaled_nkm(
     "gemm",
     "mm",
     name="torch_mm",
+    profile=OpProfile(cost_rule="torch_mm.v1"),
     solution="reference",
     signatures=_DENSE_GEMM_FORMAT_SIGNATURES,
     traits={},
@@ -439,6 +441,7 @@ def torch_bmm_fp8_scaled(
     "gemm",
     "bmm",
     name="torch_bmm",
+    profile=OpProfile(cost_rule="torch_bmm.v1"),
     solution="reference",
     signatures=_DENSE_GEMM_FORMAT_SIGNATURES,
     priority=Priority.PORTABLE + 3,

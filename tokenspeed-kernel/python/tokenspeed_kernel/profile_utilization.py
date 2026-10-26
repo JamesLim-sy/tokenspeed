@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from tokenspeed_kernel.op_profile import CollectiveTraffic
+from tokenspeed_kernel.profile_costs import CollectiveTraffic
 
 
 @dataclass(frozen=True)
@@ -261,9 +261,16 @@ def analyze_utilization(
 
         label = record["trace_label"].split(" | ts.profile/", 1)[0]
         label += f" | model={quote(report['model_id'], safe='._')}"
-        label += f" | MFU={percentage(metrics['mfu'])}"
-        label += f" Est.MBU={percentage(metrics['estimated_mbu'])}"
-        if metrics["collective_count"]:
+        collective_only = (
+            metrics["collective_count"] > 0
+            and metrics["collective_count"] == metrics["op_count"]
+        )
+        if collective_only:
+            label += f" | Est.MBU={percentage(metrics['estimated_mbu'])}"
+        else:
+            label += f" | MFU={percentage(metrics['mfu'])}"
+            label += f" Est.MBU={percentage(metrics['estimated_mbu'])}"
+        if metrics["collective_count"] and not collective_only:
             busbw = metrics["busbw_bytes_per_second"]
             display = "N/A" if busbw is None else f"{busbw / 1e9:.2f} GB/s"
             label += f" busbw={display}"

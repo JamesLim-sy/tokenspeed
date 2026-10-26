@@ -36,7 +36,9 @@ from urllib.parse import quote
 import torch
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.profile_costs import CollectiveTraffic
     from tokenspeed_kernel.profile_nvtx import NvtxTimeline
+    from tokenspeed_kernel.registry import KernelSpec
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,7 @@ class OpRecord:
     cpu_duration_ns: int
     error: str | None
     trace_label: str
+    autocast_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -279,13 +282,13 @@ def profiled(*, level: str) -> Callable:
                 _current.reset(token)
                 session.layers.append(
                     LayerRecord(
-                        context.iter_id,
-                        layer_id,
-                        occurrence,
-                        start,
-                        duration,
-                        error,
-                        label,
+                        iter_id=context.iter_id,
+                        layer_id=layer_id,
+                        occurrence=occurrence,
+                        cpu_start_ns=start,
+                        cpu_duration_ns=duration,
+                        error=error,
+                        trace_label=label,
                     )
                 )
 
@@ -294,8 +297,8 @@ def profiled(*, level: str) -> Callable:
     return decorate
 
 
-def wrap_registered_op(
-    fn: Callable, *, family: str, mode: str, name: str, profile: OpProfile
+def wrap_op_for_profiling(
+    fn: Callable, *, spec: KernelSpec, profile: OpProfile
 ) -> Callable:
     """Wrap one registered synchronous function for optional host collection."""
     if (
@@ -307,6 +310,7 @@ def wrap_registered_op(
             "OpProfile currently supports synchronous registered functions only"
         )
     signature = inspect.signature(fn)
+    op_name = f"{spec.family}.{spec.mode}"
 
     @wraps(fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -321,11 +325,14 @@ def wrap_registered_op(
         inner_id = session._counts.get(counter_key, 0)
         session._counts[counter_key] = inner_id + 1
         outputs: dict[str, TensorDescription] = {}
+        autocast_enabled = torch.is_autocast_enabled(
+            "cuda"
+        ) or torch.is_autocast_enabled("cpu")
         error = None
         start = time.perf_counter_ns()
         label = session.trace_label(
             level="op",
-            name=f"{family}.{mode}",
+            name=op_name,
             iter_id=context.iter_id,
             layer_id=context.layer_id,
             occurrence=context.occurrence,
@@ -345,57 +352,24 @@ def wrap_registered_op(
             _recording_op.reset(token)
             session.ops.append(
                 OpRecord(
-                    context.iter_id,
-                    context.layer_id,
-                    context.occurrence,
-                    inner_id,
-                    f"{family}.{mode}",
-                    name,
-                    profile.cost_rule,
-                    inputs,
-                    outputs,
-                    start,
-                    time.perf_counter_ns() - start,
-                    error,
-                    label,
+                    iter_id=context.iter_id,
+                    layer_id=context.layer_id,
+                    occurrence=context.occurrence,
+                    inner_id=inner_id,
+                    op_name=op_name,
+                    implementation=spec.name,
+                    cost_rule=profile.cost_rule,
+                    inputs=inputs,
+                    outputs=outputs,
+                    cpu_start_ns=start,
+                    cpu_duration_ns=time.perf_counter_ns() - start,
+                    error=error,
+                    trace_label=label,
+                    autocast_enabled=autocast_enabled,
                 )
             )
 
     return wrapped
-
-
-@dataclass(frozen=True)
-class CollectiveTraffic:
-    """NCCL-tests normalized traffic, not measured link or HBM bytes.
-
-    total_bytes is the full AllReduce/ReduceScatter input or AllGather output,
-    already including element size. group identifies the participating ranks.
-    """
-
-    collective: str
-    total_bytes: int
-    world_size: int
-    group: str
-
-    def __post_init__(self) -> None:
-        if self.collective not in {
-            "all_reduce_sum",
-            "reduce_scatter_sum",
-            "all_gather",
-        }:
-            raise ValueError(f"Unsupported collective: {self.collective}")
-        if type(self.world_size) is not int or self.world_size < 1:
-            raise ValueError("world_size must be a positive integer")
-        if type(self.total_bytes) is not int or self.total_bytes < 0:
-            raise ValueError("total_bytes must be a nonnegative integer byte count")
-        if not self.group.strip():
-            raise ValueError("Communication group identity is required")
-
-    @property
-    def bus_bytes(self) -> float:
-        """Return per-rank equivalent bytes; divide by seconds to obtain busbw."""
-        phases = 2 if self.collective == "all_reduce_sum" else 1
-        return self.total_bytes * phases * (self.world_size - 1) / self.world_size
 
 
 @dataclass(frozen=True)
@@ -407,7 +381,7 @@ class OpCost:
     estimated_hbm_bytes: int | None
     rule: str
     assumptions: tuple[str, ...]
-    # Storage dtype does not establish the compute engine or its precision.
+    # Cost-rule normalization key, not a measurement of executed instructions.
     compute_type: str | None = None
     communication: CollectiveTraffic | None = None
 
@@ -488,46 +462,3 @@ class CostRegistry:
             "ops": rows,
             "layers": layers,
         }
-
-
-@dataclass(frozen=True)
-class DenseMatmulCost:
-    """Plain dense 2D GEMM cost using explicit argument roles.
-
-    No padding, quantization, fusion or implicit workspace is modeled. HBM
-    traffic remains unknown; logical traffic assumes each operand read once.
-    """
-
-    lhs: str
-    rhs: str
-    output: str
-
-    def __call__(self, op: OpRecord) -> OpCost:
-        try:
-            a, b, out = (
-                op.inputs[self.lhs],
-                op.inputs[self.rhs],
-                op.outputs[self.output],
-            )
-        except KeyError as exc:
-            raise ValueError(f"Missing GEMM tensor role: {exc}") from exc
-        if len(a.shape) != 2 or len(b.shape) != 2:
-            raise ValueError("DenseMatmulCost requires 2D operands")
-        m, k = a.shape
-        kb, n = b.shape
-        if k != kb or out.shape != (m, n):
-            raise ValueError("GEMM shapes do not match")
-        flops = 2 * m * n * k
-        return OpCost(
-            flops,
-            flops,
-            a.logical_bytes + b.logical_bytes,
-            out.logical_bytes,
-            None,
-            "dense_mm.v1",
-            (
-                "unquantized dense A@B without padding or fusion",
-                "each operand read once; output written once",
-                "logical bytes do not measure HBM traffic",
-            ),
-        )

@@ -29,7 +29,71 @@ from pathlib import Path
 
 import pytest
 import torch
+from tokenspeed_kernel.op_profile import CostRegistry, OpProfile, ProfileSession
+from tokenspeed_kernel.profile_costs import (
+    AttentionMatmulCost,
+    DenseMatmulCost,
+    register_compute_costs,
+)
 from tokenspeed_kernel.profile_nvtx import build_nvtx_bridge
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+
+
+def test_compute_type_uses_gpu_operands_not_output_dtype():
+    if not torch.cuda.is_available():
+        pytest.skip("Requires CUDA")
+    from tokenspeed_kernel.numerics.reference.gemm import torch_bmm, torch_mm
+
+    def dense(a, b):
+        return (a @ b).double()
+
+    def attention(q, k, v):
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, enable_gqa=True
+        ).double()
+
+    registry = KernelRegistry()
+    for name, fn in (("dense", dense), ("attention", attention)):
+        registry.register(
+            KernelSpec(name=name, family=name, mode="test"),
+            fn,
+            profile=OpProfile(cost_rule=name),
+        )
+    costs = CostRegistry()
+    register_compute_costs(costs, hbm_policy="unavailable")
+    costs.register("dense", DenseMatmulCost(lhs="a", rhs="b", output="return"))
+    costs.register(
+        "attention",
+        AttentionMatmulCost(q="q", k="k", v="v", output="return", mask="full"),
+    )
+    cases = (
+        (torch.bfloat16, False, "bf16_tensor"),
+        (torch.float16, False, "fp16_tensor"),
+        (torch.float32, False, None),
+        (torch.bfloat16, True, None),
+    )
+    for dtype, autocast_enabled, expected in cases:
+        a = torch.randn(16, 32, device="cuda", dtype=dtype)
+        b = torch.randn(24, 32, device="cuda", dtype=dtype)
+        q = torch.randn(1, 4, 2, 8, device="cuda", dtype=dtype)
+        k = torch.randn(1, 2, 4, 8, device="cuda", dtype=dtype)
+        v = torch.randn_like(k)
+        session = ProfileSession(
+            run_id="inference", model_id="test", rank=0, backend="none"
+        )
+        with torch.autocast("cuda", dtype=torch.float16, enabled=autocast_enabled):
+            with session.iteration(iter_id=0):
+                registry.get_impl("dense")(a, b.T)
+                torch_mm(a, b, None, None, torch.float64)
+                torch_bmm(a.unsqueeze(0), b.unsqueeze(0), None, None, torch.float64)
+                registry.get_impl("attention")(q, k, v)
+        report = session.report(costs=costs)
+        assert len(session.ops) == 4
+        assert all(op.outputs["return"].dtype == "torch.float64" for op in session.ops)
+        assert all(op.autocast_enabled == autocast_enabled for op in session.ops)
+        assert all(
+            row["cost"]["compute_type"] == expected for row in report["analysis"]["ops"]
+        )
 
 
 def test_native_ranges_preserve_thread_nesting_and_gpu_projection(tmp_path):
@@ -49,27 +113,75 @@ def test_native_ranges_preserve_thread_nesting_and_gpu_projection(tmp_path):
         )
     )
     output = tmp_path / "capture"
+    output.mkdir()
+    build_nvtx_bridge(
+        include_dir=Path(nsys).resolve().parent / "nvtx/include",
+        output=output / "nvtx_profile.so",
+        compiler="cc",
+    )
+    script = tmp_path / "workload.py"
+    script.write_text(textwrap.dedent("""\
+        import sys
+        from pathlib import Path
+        import torch
+        from tokenspeed_kernel.numerics.reference.gemm import torch_mm
+        from tokenspeed_kernel.op_profile import CostRegistry, ProfileSession, profiled
+        from tokenspeed_kernel.profile_costs import register_compute_costs
+        from tokenspeed_kernel.profile_nvtx import NvtxTimeline
+        from tokenspeed_kernel.profile_utilization import HardwareProfile
+
+        class TwoMatmulLayer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("up", torch.randn(256, 256, device="cuda", dtype=torch.bfloat16))
+                self.register_buffer("down", torch.randn_like(self.up))
+
+            @profiled(level="layer")
+            def forward(self, x):
+                hidden = torch_mm(x, self.up, None, None, torch.bfloat16)
+                return torch_mm(hidden, self.down, None, None, torch.bfloat16)
+
+        root = Path(sys.argv[1])
+        output = root / "capture"
+        layer = TwoMatmulLayer()
+        x = torch.randn_like(layer.up)
+        reference = torch.mm(torch.mm(x, layer.up.T), layer.down.T)
+        for _ in range(5):
+            layer(x)
+        torch.cuda.synchronize()
+        session = ProfileSession(run_id="native-test", model_id="two-matmul", rank=0, backend="nvtx")
+        session.bind_layer(layer, layer_id=7)
+        costs = CostRegistry()
+        register_compute_costs(costs, hbm_policy="logical_io_once")
+        with NvtxTimeline(
+            session, costs=costs,
+            hardware=HardwareProfile.from_json(root / "hardware.json"),
+            stream=torch.cuda.current_stream(), max_scopes=6,
+            library=output / "nvtx_profile.so", output=output / "metrics.json",
+        ):
+            for iteration in range(2):
+                with session.iteration(iter_id=iteration):
+                    result = layer(x)
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+    """))
     env = dict(os.environ, PYTHONPATH=str(kernel_root / "python"))
     command = [
-        sys.executable,
-        str(kernel_root / "test/nvidia/profile_layers_cuda.py"),
-        "--nsys",
         nsys,
-        "--hardware",
-        str(hardware),
-        "--output-dir",
-        str(output),
-        "--hbm-policy",
-        "logical_io_once",
-        "--size",
-        "256",
-        "--iterations",
-        "2",
+        "profile",
+        "--trace=cuda,nvtx",
+        "--sample=none",
+        "--cpuctxsw=none",
+        f"--output={output / 'timeline'}",
+        sys.executable,
+        str(script),
+        str(tmp_path),
     ]
     subprocess.run(
         command, env=env, check=True, capture_output=True, text=True, timeout=180
     )
     report = json.loads((output / "metrics.json").read_text())
+    assert {op["implementation"] for op in report["ops"]} == {"torch_mm"}
+    assert {op["cost_rule"] for op in report["ops"]} == {"torch_mm.v1"}
     rows = report["device_analysis"]["scopes"]
     assert len(rows) == 6
     assert all(r["mfu"] > 0 and r["estimated_mbu"] > 0 for r in rows)
@@ -127,18 +239,25 @@ def test_finalize_once_and_recover_after_workload_exception(tmp_path):
         from pathlib import Path
         import torch
         from tokenspeed_kernel.op_profile import (
-            ProfileSession, CostRegistry, DenseMatmulCost, OpProfile, wrap_registered_op,
+            ProfileSession, CostRegistry, OpProfile,
         )
+        from tokenspeed_kernel.profile_costs import DenseMatmulCost
         from tokenspeed_kernel.profile_nvtx import NvtxTimeline
         from tokenspeed_kernel.profile_utilization import HardwareProfile
+        from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 
         root = Path(sys.argv[1])
         def work(a, b):
             if b is None:
                 raise ValueError("intentional workload failure")
             return a @ b
-        mm = wrap_registered_op(work, family="gemm", mode="mm", name="test",
-                                profile=OpProfile(cost_rule="mm"))
+        registry = KernelRegistry()
+        registry.register(
+            KernelSpec(name="test", family="gemm", mode="mm"),
+            work,
+            profile=OpProfile(cost_rule="mm"),
+        )
+        mm = registry.get_impl("test")
         dense = DenseMatmulCost(lhs="a", rhs="b", output="return")
         costs = CostRegistry()
         costs.register("mm", lambda op: replace(dense(op), compute_type="test",
@@ -238,10 +357,11 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
         from pathlib import Path
         import torch
         import torch.distributed as dist
-        from tokenspeed_kernel.op_profile import CostRegistry, OpProfile, ProfileSession, profiled, wrap_registered_op
+        from tokenspeed_kernel.op_profile import CostRegistry, OpProfile, ProfileSession, profiled
         from tokenspeed_kernel.profile_costs import CollectiveCost
         from tokenspeed_kernel.profile_nvtx import NvtxTimeline
         from tokenspeed_kernel.profile_utilization import HardwareProfile
+        from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 
         root = Path(sys.argv[1])
         rank = int(os.environ["LOCAL_RANK"])
@@ -258,10 +378,24 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
             dist.all_gather_into_tensor(out, x, async_op=True).wait()
             return out
         functions = {"all_reduce_sum": reduce, "reduce_scatter_sum": scatter, "all_gather": gather}
-        wrapped = {name: wrap_registered_op(fn, family="collective", mode=name, name=name, profile=OpProfile(cost_rule=name)) for name, fn in functions.items()}
+        registry = KernelRegistry()
+        wrapped = {}
         costs = CostRegistry()
-        for name in functions:
-            costs.register(name, CollectiveCost(name, "return" if name == "all_gather" else "x", "output" if name == "all_gather" else "input", size, "world:0-1"))
+        for name, fn in functions.items():
+            registry.register(
+                KernelSpec(name=name, family="collective", mode=name),
+                fn,
+                profile=OpProfile(cost_rule=name),
+            )
+            wrapped[name] = registry.get_impl(name)
+            is_gather = name == "all_gather"
+            costs.register(name, CollectiveCost(
+                collective=name,
+                tensor="return" if is_gather else "x",
+                tensor_source="output" if is_gather else "input",
+                world_size=size,
+                group="world:0-1",
+            ))
         full = torch.full((16384,), rank + 1., device="cuda")
         shard = torch.full((16384 // size,), rank + 1., device="cuda")
         scattered = torch.empty_like(shard)
@@ -341,7 +475,8 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
             )
             assert row["mfu"] is None and row["estimated_mbu"] is None
             label = row["nvtx_label"]
-            assert f"busbw={row['busbw_bytes_per_second']/1e9:.2f} GB/s" in label
+            assert "Est.MBU=N/A" in label
+            assert "MFU=" not in label and "busbw=" not in label
             assert (
                 int(projected[label]["TID"]) == report["device_analysis"]["thread_id"]
             )
@@ -350,7 +485,7 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
         f"file:{tmp_path / 'collectives.sqlite'}?mode=ro", uri=True
     ) as db:
         events = db.execute(
-            "SELECT eventType, globalTid FROM NVTX_EVENTS WHERE text LIKE '%busbw=%'"
+            "SELECT eventType, globalTid FROM NVTX_EVENTS WHERE text LIKE '%Est.MBU=%'"
         ).fetchall()
     assert len(events) == 8
     assert {event[0] for event in events} == {59}

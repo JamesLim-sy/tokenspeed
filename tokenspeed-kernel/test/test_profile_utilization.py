@@ -23,25 +23,48 @@ from dataclasses import asdict, replace
 import pytest
 import torch
 from tokenspeed_kernel.op_profile import (
-    CollectiveTraffic,
     CostRegistry,
-    DenseMatmulCost,
     OpProfile,
     ProfileSession,
     profiled,
-    wrap_registered_op,
 )
 from tokenspeed_kernel.profile_costs import (
     AttentionMatmulCost,
     CollectiveCost,
-    attention_matmul_flops,
+    CollectiveTraffic,
+    DenseMatmulCost,
+    register_compute_costs,
 )
 from tokenspeed_kernel.profile_utilization import (
     HardwareProfile,
     ScopeTiming,
     analyze_utilization,
 )
-from tokenspeed_kernel.registry import register_kernel
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, register_kernel
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_registered_compute_costs(batched):
+    from tokenspeed_kernel.numerics.reference.gemm import torch_bmm, torch_mm
+
+    batch = (2,) if batched else ()
+    a, b = torch.randn(*batch, 3, 5), torch.randn(*batch, 4, 5)
+    fn = torch_bmm if batched else torch_mm
+    session = ProfileSession(run_id="compute", model_id="test", rank=0, backend="none")
+    with session.iteration(iter_id=0):
+        result = fn(a, b, None, None, torch.float64)
+    torch.testing.assert_close(result, (a @ b.transpose(-1, -2)).double())
+    costs = CostRegistry()
+    register_compute_costs(costs, hbm_policy="unavailable")
+    record = session.ops[0]
+    assert record.implementation == ("torch_bmm" if batched else "torch_mm")
+    report = session.report(costs=costs)
+    cost = report["analysis"]["ops"][0]["cost"]
+    assert cost["useful_flops"] == 2 * (2 if batched else 1) * 3 * 4 * 5
+    assert cost["logical_read_bytes"] == (a.numel() + b.numel()) * 4
+    assert cost["logical_write_bytes"] == result.numel() * 8
+    assert cost["compute_type"] is None
+    assert cost["estimated_hbm_bytes"] is None
 
 
 @pytest.fixture
@@ -256,7 +279,9 @@ def test_collective_bytes_and_busbw(fixture, kind, source, role, total, bus):
     assert row["busbw_bytes_per_second"] == pytest.approx(bus / 0.1)
     assert row["algbw_bytes_per_second"] == pytest.approx(total / 0.1)
     assert row["mfu"] is None and row["estimated_mbu"] is None
-    assert "busbw=" in row["nvtx_label"]
+    assert "Est.MBU=N/A" in row["nvtx_label"]
+    assert "MFU=" not in row["nvtx_label"]
+    assert "busbw=" not in row["nvtx_label"]
 
 
 def test_layer_busbw_window_and_unavailable_results(fixture):
@@ -304,8 +329,23 @@ def test_layer_busbw_window_and_unavailable_results(fixture):
         CollectiveTraffic("all_reduce_sum", 64, 0, "empty")
 
 
-def test_attention_valid_pairs():
-    for q, k, mask, pairs in (
+def test_attention_cost_uses_query_heads_and_causal_pairs():
+    def attention(q, k, v, *, attn_mask):
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, enable_gqa=True
+        )
+
+    registry = KernelRegistry()
+    registry.register(
+        KernelSpec(name="test", family="attention", mode="gqa"),
+        attention,
+        profile=OpProfile(cost_rule="attention"),
+    )
+    wrapped = registry.get_impl("test")
+    session = ProfileSession(
+        run_id="attention", model_id="test", rank=0, backend="none"
+    )
+    cases = (
         (4, 4, "full", 16),
         (4, 4, "causal_lower_right", 10),
         (1, 8, "causal_lower_right", 8),
@@ -313,39 +353,24 @@ def test_attention_valid_pairs():
         (5, 2, "causal_lower_right", 3),
         (2, 5, "causal_upper_left", 3),
         (5, 2, "causal_upper_left", 9),
-    ):
-        actual = attention_matmul_flops(
-            batch_size=2,
-            query_heads=4,
-            query_length=q,
-            kv_length=k,
-            qk_head_dim=3,
-            value_head_dim=5,
-            mask=mask,
-        )
-        assert actual == 2 * 2 * 4 * pairs * (3 + 5)
-
-
-def test_attention_cost_uses_query_heads_for_gqa():
-    def attention(q, k, v):
-        return torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, enable_gqa=True
-        )
-
-    wrapped = wrap_registered_op(
-        attention,
-        family="attention",
-        mode="gqa",
-        name="test",
-        profile=OpProfile(cost_rule="attention"),
     )
-    session = ProfileSession(
-        run_id="attention", model_id="test", rank=0, backend="none"
-    )
-    with session.iteration(iter_id=0):
-        wrapped(
-            torch.randn(2, 4, 3, 8), torch.randn(2, 2, 5, 8), torch.randn(2, 2, 5, 6)
-        )
-    cost = AttentionMatmulCost("q", "k", "v", "return", "full", None)(session.ops[0])
-    assert cost.useful_flops == 2 * 2 * 4 * 3 * 5 * (8 + 6)
-    assert cost.executed_flops is None and cost.estimated_hbm_bytes is None
+    for iter_id, (query_length, kv_length, mask, pairs) in enumerate(cases):
+        attn_mask = None
+        if mask != "full":
+            offset = kv_length - query_length if mask == "causal_lower_right" else 0
+            attn_mask = (
+                torch.arange(kv_length)[None, :]
+                <= torch.arange(query_length)[:, None] + offset
+            )
+            assert attn_mask.sum().item() == pairs
+        with session.iteration(iter_id=iter_id):
+            wrapped(
+                torch.randn(2, 4, query_length, 3),
+                torch.randn(2, 2, kv_length, 3),
+                torch.randn(2, 2, kv_length, 5),
+                attn_mask=attn_mask,
+            )
+        rule = AttentionMatmulCost(q="q", k="k", v="v", output="return", mask=mask)
+        cost = rule(session.ops[-1])
+        assert cost.useful_flops == 2 * 2 * 4 * pairs * (3 + 5)
+        assert cost.executed_flops is None and cost.estimated_hbm_bytes is None

@@ -26,29 +26,27 @@ import pytest
 import torch
 from tokenspeed_kernel.op_profile import (
     CostRegistry,
-    DenseMatmulCost,
     OpProfile,
     ProfileSession,
     profiled,
 )
-from tokenspeed_kernel.registry import KernelRegistry, register_kernel
+from tokenspeed_kernel.profile_costs import DenseMatmulCost
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, register_kernel
 from tokenspeed_kernel.selection import SelectedKernel
 
 
 @pytest.fixture
 def mm(fresh_registry):
-    @register_kernel(
-        "gemm",
-        "mm",
-        name="profile_test_mm",
-        solution="reference",
-        signatures=frozenset(),
-        profile=OpProfile(cost_rule="dense_mm"),
-    )
     def matmul(a, b, *, out=None):
         return torch.mm(a, b, out=out)
 
-    return matmul
+    registry = KernelRegistry.get()
+    spec = KernelSpec(
+        name="profile_test_mm", family="gemm", mode="mm", solution="reference"
+    )
+    result = registry.register(spec, matmul, profile=OpProfile(cost_rule="dense_mm"))
+    assert result is None
+    return registry.get_impl(spec.name)
 
 
 class Layer:
@@ -216,6 +214,13 @@ def test_stateful_registration_explicitly_rejects_profile(fresh_registry):
             profile=OpProfile(cost_rule=None),
         )(Stateful)
     assert KernelRegistry.get().get_by_name("stateful") is None
+
+    registry = KernelRegistry.get()
+    spec = KernelSpec(name="stateful", family="test", mode="stateful")
+    registry.register(spec, lambda x: x + 1)
+    with pytest.raises(TypeError, match="synchronous registered functions"):
+        registry.register(spec, Stateful, profile=OpProfile(cost_rule=None))
+    assert registry.get_impl("stateful")(2) == 3
 
 
 def test_nested_session_rejected_and_recovery(mm):
