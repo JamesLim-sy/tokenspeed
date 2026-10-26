@@ -30,10 +30,13 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 from urllib.parse import quote
 
 import torch
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.profile_nvtx import NvtxTimeline
 
 
 @dataclass(frozen=True)
@@ -133,9 +136,12 @@ class ProfileSession:
         self._active = False
         self._counts: dict[tuple[int, int | None], int] = {}
         self._occurrences: dict[tuple[int, int], int] = {}
+        self._timeline: NvtxTimeline | None = None
 
     def record_func(self, label: str):
         """Return the selected annotation scope; collector lifetime stays external."""
+        if self._timeline is not None:
+            return self._timeline.record_func(label)
         if self.backend == "nvtx":
             return torch.cuda.nvtx.range(label)
         if self.backend == "torch":
@@ -198,9 +204,9 @@ class ProfileSession:
             _current.reset(token)
             self._active = False
 
-    def export(self, path: str | Path, *, costs: CostRegistry) -> None:
-        """Write metadata and offline op/layer costs to JSON; return None."""
-        payload = {
+    def report(self, *, costs: CostRegistry) -> dict[str, Any]:
+        """Return collected metadata and costs without retaining tensor storage."""
+        return {
             "schema_version": 1,
             "run_id": self.run_id,
             "model_id": self.model_id,
@@ -212,9 +218,12 @@ class ProfileSession:
             "layers": [asdict(record) for record in self.layers],
             "analysis": costs.analyze(self),
         }
+
+    def export(self, path: str | Path, *, costs: CostRegistry) -> None:
+        """Write metadata and offline op/layer costs to JSON; return None."""
         output = Path(path)
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(payload, indent=2) + "\n")
+        output.write_text(json.dumps(self.report(costs=costs), indent=2) + "\n")
 
 
 def profiled(*, level: str) -> Callable:
@@ -356,6 +365,40 @@ def wrap_registered_op(
 
 
 @dataclass(frozen=True)
+class CollectiveTraffic:
+    """NCCL-tests normalized traffic, not measured link or HBM bytes.
+
+    total_bytes is the full AllReduce/ReduceScatter input or AllGather output,
+    already including element size. group identifies the participating ranks.
+    """
+
+    collective: str
+    total_bytes: int
+    world_size: int
+    group: str
+
+    def __post_init__(self) -> None:
+        if self.collective not in {
+            "all_reduce_sum",
+            "reduce_scatter_sum",
+            "all_gather",
+        }:
+            raise ValueError(f"Unsupported collective: {self.collective}")
+        if type(self.world_size) is not int or self.world_size < 1:
+            raise ValueError("world_size must be a positive integer")
+        if type(self.total_bytes) is not int or self.total_bytes < 0:
+            raise ValueError("total_bytes must be a nonnegative integer byte count")
+        if not self.group.strip():
+            raise ValueError("Communication group identity is required")
+
+    @property
+    def bus_bytes(self) -> float:
+        """Return per-rank equivalent bytes; divide by seconds to obtain busbw."""
+        phases = 2 if self.collective == "all_reduce_sum" else 1
+        return self.total_bytes * phases * (self.world_size - 1) / self.world_size
+
+
+@dataclass(frozen=True)
 class OpCost:
     useful_flops: int
     executed_flops: int | None
@@ -364,6 +407,9 @@ class OpCost:
     estimated_hbm_bytes: int | None
     rule: str
     assumptions: tuple[str, ...]
+    # Storage dtype does not establish the compute engine or its precision.
+    compute_type: str | None = None
+    communication: CollectiveTraffic | None = None
 
 
 class CostRegistry:
