@@ -61,12 +61,50 @@ void trtllm_mnnvl_allreduce_fusion(
     Optional<TensorView> rms_gamma, Optional<double> rms_eps, Optional<TensorView> attnres_m,
     Optional<TensorView> attnres_s, Optional<TensorView> attnres_acc,
     Optional<TensorView> attnres_res_w, Optional<TensorView> attnres_out_norm_w,
-    Optional<int64_t> latent_width) {
+    Optional<int64_t> latent_width, Optional<TensorView> quant_out,
+    Optional<TensorView> scale_out) {
   cudaSetDevice(allreduce_in.device().device_id);
   TVM_FFI_ICHECK(multicast_ptr != 0) << "multicast_ptr must be a valid NVLS multicast VA";
   TVM_FFI_ICHECK(buffer_ptr_local != 0) << "buffer_ptr_local must be a valid unicast VA";
   TVM_FFI_ICHECK(peer_ptrs.numel() == world_size)
       << "peer_ptrs must hold one unicast base per rank";
+
+  if (pattern_code == static_cast<int64_t>(AllReduceFusionPattern::kARResidualRMSNormFP8BlockWiseQuant)) {
+    TVM_FFI_ICHECK(flashinfer::trtllm_allreduce_fusion::utils::getSMVersion() == 90 && hidden_size % 128 == 0)
+        << "MNNVL group-128 FP8 requires Hopper and a hidden size divisible by 128";
+    TVM_FFI_ICHECK(residual_in.has_value() && residual_out.has_value() &&
+                   rms_gamma.has_value() && rms_eps.has_value() &&
+                   quant_out.has_value() && scale_out.has_value())
+        << "MNNVL FP8 requires residual, norm weight/epsilon and quant/scale outputs";
+    CHECK_DIM(2, allreduce_in);
+    TVM_FFI_ICHECK(allreduce_in.size(0) == token_num && allreduce_in.size(1) == hidden_size);
+    for (auto tensor : {allreduce_in, residual_in.value(), residual_out.value(), rms_gamma.value()}) {
+      CHECK_INPUT(tensor);
+      CHECK_DEVICE(tensor, allreduce_in);
+      TVM_FFI_ICHECK(encode_dlpack_dtype(tensor.dtype()) == bfloat16_code)
+          << "MNNVL group-128 FP8 requires BF16 inputs";
+    }
+    CHECK_SHAPE(residual_in.value(), allreduce_in);
+    CHECK_SHAPE(residual_out.value(), allreduce_in);
+    TVM_FFI_ICHECK(rms_gamma.value().numel() == hidden_size);
+    auto q = quant_out.value();
+    auto s = scale_out.value();
+    CHECK_INPUT(q);
+    CHECK_DEVICE(q, allreduce_in);
+    CHECK_SHAPE(q, allreduce_in);
+    TVM_FFI_ICHECK(encode_dlpack_dtype(q.dtype()) == float8_e4m3fn_code)
+        << "quant_out must be FP8 E4M3";
+    CHECK_DEVICE(s, allreduce_in);
+    CHECK_DIM(2, s);
+    TVM_FFI_ICHECK(encode_dlpack_dtype(s.dtype()) == float32_code)
+        << "scale_out must be FP32";
+    TVM_FFI_ICHECK(s.size(0) == token_num && s.size(1) == hidden_size / 128 &&
+                   s.stride(0) == 1 && s.stride(1) >= token_num && s.stride(1) % 4 == 0)
+        << "scale_out must be [tokens, hidden/128], column-major with a 4-row aligned stride";
+  } else {
+    TVM_FFI_ICHECK(!quant_out.has_value() && !scale_out.has_value())
+        << "MNNVL quant/scale outputs require the group-128 FP8 pattern";
+  }
 
   DISPATCH_HALF_TYPES_FOR_MNNVL_ALLREDUCE(allreduce_in.dtype(), c_type, [&] {
     AllReduceFusionParams<c_type> params;
@@ -87,9 +125,9 @@ void trtllm_mnnvl_allreduce_fusion(
     params.norm_out =
         norm_out.has_value() ? reinterpret_cast<void*>(norm_out.value().data_ptr()) : nullptr;
     params.partial_normed_out = nullptr;
-    params.quant_out = nullptr;
-    params.scale_out = nullptr;
-    params.scale_stride = 0;
+    params.quant_out = quant_out.has_value() ? quant_out.value().data_ptr() : nullptr;
+    params.scale_out = scale_out.has_value() ? scale_out.value().data_ptr() : nullptr;
+    params.scale_stride = scale_out.has_value() ? int32_t(scale_out.value().stride(1)) : 0;
     params.rms_gamma =
         rms_gamma.has_value() ? reinterpret_cast<void*>(rms_gamma.value().data_ptr()) : nullptr;
     params.rms_eps = rms_eps.has_value() ? static_cast<float>(rms_eps.value()) : 0.0f;

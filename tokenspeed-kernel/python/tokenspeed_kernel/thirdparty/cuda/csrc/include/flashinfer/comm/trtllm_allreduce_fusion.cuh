@@ -978,7 +978,7 @@ class Barrier {
   int* m_current_flag;
 };
 
-template <AllReduceFusionPattern Pattern, typename T>
+template <AllReduceFusionPattern Pattern, typename T, bool MatchStandaloneFp8>
 class FusedOp {
   static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
   static constexpr float FP8_E4M3_MAX = 448.0f;
@@ -1138,7 +1138,8 @@ class FusedOp {
 
     int32_t access_id_in_token = cluster.thread_rank();
 
-    float _absmax = 1e-10f;
+    // Match standalone BF16 -> FP8 rounding only for the MNNVL epilogue.
+    float _absmax = MatchStandaloneFp8 ? static_cast<float>(static_cast<T>(1e-10f)) : 1e-10f;
     vec_t<__nv_fp8_e4m3, VEC_SIZE> quanted_out;
     auto tile_16 = cg::tiled_partition<16>(cg::this_thread_block());
 #pragma unroll
@@ -1148,8 +1149,14 @@ class FusedOp {
     }
     _absmax = cg::reduce(tile_16, _absmax, [](float a, float b) { return a > b ? a : b; });
 
-    float scale;
-    asm("div.full.f32 %0, %1, %2;" : "=f"(scale) : "f"(_absmax), "f"(FP8_E4M3_MAX));
+    float scale, reverse_scale;
+    if constexpr (MatchStandaloneFp8) {
+      reverse_scale = __fdiv_rn(FP8_E4M3_MAX, _absmax);
+      scale = __fdiv_rn(1.0f, reverse_scale);
+    } else {
+      asm("div.full.f32 %0, %1, %2;" : "=f"(scale) : "f"(_absmax), "f"(FP8_E4M3_MAX));
+      reverse_scale = 1.0 / scale;
+    }
 
     // directly write scale to scale_out
     if (tile_16.thread_rank() == 0) {
@@ -1158,7 +1165,6 @@ class FusedOp {
     }
     tile_16.sync();
 
-    float reverse_scale = 1.0 / scale;
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; i++) {
       float x = static_cast<float>(normed_res[i]) * reverse_scale;
@@ -1560,7 +1566,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(
   int tot_access = index_helper.tot_access;
   vec_t<T, VEC_SIZE> clear_vec;
   clear_vec.fill(neg_zero_v<T>);
-  FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
+  FusedOp<Pattern, T, false> fused_op(params, access_id, access_id_in_token);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
@@ -1648,7 +1654,7 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> pa
   int access_id = index_helper.access_id;
   int access_stride = index_helper.access_stride;
   int tot_access = index_helper.tot_access;
-  FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
+  FusedOp<Pattern, T, false> fused_op(params, access_id, access_id_in_token);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
 #endif

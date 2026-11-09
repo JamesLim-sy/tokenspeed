@@ -81,6 +81,7 @@ __all__ = [
     "AllReduceFusionPattern",
     "allgather_dual_rmsnorm",
     "allreduce_residual_rmsnorm",
+    "mnnvl_allreduce_residual_rmsnorm_fp8",
     "allreduce_sandwich_rmsnorm",
     "reducescatter_residual_rmsnorm",
     "trtllm_allreduce_fusion",
@@ -106,6 +107,7 @@ trtllm_reduce_scatter = error_fn
 MNNVL_TWOSHOT_MAX_TOKEN = 0
 allgather_dual_rmsnorm = error_fn
 allreduce_residual_rmsnorm = error_fn
+mnnvl_allreduce_residual_rmsnorm_fp8 = error_fn
 allreduce_sandwich_rmsnorm = error_fn
 trtllm_workspace_all_gather = error_fn
 trtllm_workspace_allreduce = error_fn
@@ -583,14 +585,20 @@ if current_platform().is_nvidia:
         )
         if ipc_ok and prefer_ipc:
             return _mark_captured(manager, manager.workspace_tensor)
-        if mnnvl is not None and mnnvl.supports(
-            token_num,
-            hidden_dim,
-            dtype,
-            manager.world_size,
-            pattern_code,
-            use_oneshot=use_oneshot,
-            residual_reduce_scattered=residual_reduce_scattered,
+        # Group FP8 opts into MNNVL through its dedicated entry below.
+        # Keep legacy callers on their original IPC / unfused routing.
+        if (
+            pattern_code != AllReduceFusionPattern.kARResidualRMSNormFP8BlockWiseQuant
+            and mnnvl is not None
+            and mnnvl.supports(
+                token_num,
+                hidden_dim,
+                dtype,
+                manager.world_size,
+                pattern_code,
+                use_oneshot=use_oneshot,
+                residual_reduce_scattered=residual_reduce_scattered,
+            )
         ):
             return _mark_captured(manager, mnnvl)
         # Cross-node there is no IPC workspace, so a shape/pattern mnnvl rejects
@@ -630,9 +638,7 @@ if current_platform().is_nvidia:
     ):
         """Unfused NCCL + torch epilogue for the rmsnorm fusion family.
 
-        Cross-node groups have no IPC workspace, and the mnnvl kernel does not
-        implement the block-quant / partial-out epilogues, so those calls land
-        here instead of aborting. Mirrors the fused contract exactly:
+        Used when no workspace serves the call. Mirrors the fused output contract:
         (quant_out, residual_out, scale_out, partial_norm_out) when
         block_quant_fp8 else (norm_out, residual_out, None, partial_norm_out).
         The all-reduce runs on NCCL (different reduction order than the fused
@@ -1068,7 +1074,7 @@ if current_platform().is_nvidia:
             resolved_oneshot = requested_oneshot
         if workspace is None:
             # Cross-node group, pattern/shape the mnnvl kernel cannot serve
-            # (block-quant or partial-out epilogue, oversized call). Degrade to
+            # (partial-out epilogue, oversized call). Degrade to
             # the unfused NCCL path instead of aborting the forward pass.
             if residual_reduce_scattered:
                 # The input arrives reduce-scattered; a blind all-reduce would
@@ -1121,6 +1127,101 @@ if current_platform().is_nvidia:
             return quant_out, residual_out, scale_out, partial_norm_out
         else:
             return norm_out, residual_out, None, partial_norm_out
+
+    def mnnvl_allreduce_residual_rmsnorm_fp8(
+        input_tensor: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        group: dist.ProcessGroup,
+        *,
+        eps: float,
+        max_token_num: int,
+        use_oneshot: bool | None,
+        trigger_completion_at_end: bool,
+        fp32_acc: bool,
+        launch_with_pdl: bool | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """AR + residual RMSNorm with optional MNNVL group-128 FP8 output.
+
+        Inputs are contiguous [M,H] activations/residual and [H] norm weight.
+        rank/group identify the TP collective; eps and max_token_num are the
+        norm epsilon and workspace cap. Launch options keep their ordinary
+        AR meanings. Only Hopper BF16, 0<M<=2048 and H divisible by 128 can
+        fuse quantization, subject to workspace capacity. Returns E4M3 values,
+        updated residual and MN-major FP32 scales; otherwise ordinary AR+norm
+        outputs and None scales. This entry never uses the IPC FP8 epilogue.
+        """
+        token_num, hidden_dim = input_tensor.shape
+        if not ensure_workspace_initialized(
+            rank=rank,
+            group=group,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            use_fp32_lamport=(input_tensor.dtype == torch.float32),
+        ):
+            raise RuntimeError("TRT-LLM fusion workspace not available")
+        manager = _manager_for_group(group)
+        workspace = manager.mnnvl_workspace
+        pattern = AllReduceFusionPattern.kARResidualRMSNormFP8BlockWiseQuant
+        resolved_oneshot = (
+            workspace.resolve_use_oneshot(token_num, use_oneshot, hidden_dim)
+            if workspace is not None
+            else use_oneshot
+        )
+        if (
+            workspace is None
+            or token_num > max_token_num
+            or not workspace.supports(
+                token_num,
+                hidden_dim,
+                input_tensor.dtype,
+                manager.world_size,
+                pattern,
+                use_oneshot=resolved_oneshot,
+            )
+        ):
+            values, updated_residual, *_ = allreduce_residual_rmsnorm(
+                input_tensor,
+                residual,
+                weight,
+                rank,
+                group,
+                eps=eps,
+                max_token_num=max_token_num,
+                use_oneshot=use_oneshot,
+                trigger_completion_at_end=trigger_completion_at_end,
+                fp32_acc=fp32_acc,
+                block_quant_fp8=False,
+                launch_with_pdl=launch_with_pdl,
+            )
+            return values, updated_residual, None
+
+        quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+        residual_out = torch.empty_like(residual)
+        scale_out = _create_per_token_group_quant_fp8_output_scale(
+            input_tensor.shape, input_tensor.device, 128, True, True, False
+        )
+        trtllm_allreduce_fusion(
+            allreduce_in=input_tensor,
+            world_size=manager.world_size,
+            world_rank=rank,
+            token_num=token_num,
+            hidden_dim=hidden_dim,
+            workspace_ptrs=_mark_captured(manager, workspace),
+            pattern_code=pattern,
+            use_oneshot=resolved_oneshot,
+            trigger_completion_at_end=trigger_completion_at_end,
+            fp32_acc=fp32_acc,
+            launch_with_pdl=launch_with_pdl,
+            residual_in=residual,
+            residual_out=residual_out,
+            rms_gamma=weight,
+            rms_eps=eps,
+            quant_out=quant_out,
+            scale_out=scale_out,
+        )
+        return quant_out, residual_out, scale_out
 
     def _sandwich_scale_pair(
         x_scale: float | None, residual_scale: float | None

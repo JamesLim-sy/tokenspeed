@@ -1,5 +1,25 @@
 # Communication kernels
 
+## All-reduce + residual + RMSNorm + FP8
+
+The opt-in `mnnvl_allreduce_residual_rmsnorm_fp8` entry uses MNNVL for
+group-128 FP8 on SM90 Hopper with BF16 inputs, a hidden size divisible by 128,
+and 1..2048 actual input rows that fit the armed workspace. Rows include all
+speculative tokens (for example, 32 requests with 8 tokens each give M=256).
+One-shot/two-shot selection uses the workspace policy. Unsupported calls use
+ordinary AR+norm and return None scales so the consumer quantizes as before.
+Only this entry excludes the IPC FP8 epilogue. The general fusion wrapper
+retains its original IPC/unfused routing for block FP8, including Blackwell,
+FP16 and more than 2048 rows. Ordinary AR+norm, reduce-scatter and partial norm
+output retain their existing routing.
+
+The epilogue returns E4M3 values, BF16 residuals, and FP32 column-major scales
+with a 4-row aligned leading dimension. Pass those scale views directly to
+consumers that accept this layout. MNNVL uses the standalone TRT-LLM
+quantizer's scale rounding; IPC retains its previous arithmetic. These fused
+collectives make no batch-invariance guarantee: the runtime's existing
+`rl-bitwise` / unfused-boundary policy continues to exclude them.
+
 ## Paged-row all-gather
 
 `cute_dsl_paged_row_all_gather` (SM100 and SM103: GB200, GB300) all-gathers

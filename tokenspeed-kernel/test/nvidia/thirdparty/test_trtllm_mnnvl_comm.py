@@ -426,7 +426,8 @@ def test_graph_replay_self_reset():
         dist.barrier()
 
 
-def test_rmsnorm_family_unfused_fallback():
+@pytest.mark.parametrize("block_quant_fp8", [False, True])
+def test_rmsnorm_family_unfused_fallback(block_quant_fp8):
     """Patterns the mnnvl kernel cannot serve degrade to the unfused NCCL path.
 
     Cross-node there is no IPC workspace, so block-quant / partial-out rmsnorm
@@ -466,6 +467,7 @@ def test_rmsnorm_family_unfused_fallback():
             group=pg,
             eps=EPS,
             max_token_num=MAXTOK,
+            block_quant_fp8=block_quant_fp8,
         )
         with pytest.raises(RuntimeError):
             comm.allreduce_residual_rmsnorm(
@@ -476,19 +478,26 @@ def test_rmsnorm_family_unfused_fallback():
                 group=pg,
                 eps=EPS,
                 max_token_num=MAXTOK,
+                block_quant_fp8=block_quant_fp8,
                 residual_reduce_scattered=True,
             )
     finally:
         mgr.workspace_tensor, mgr.mnnvl_workspace = saved
 
-    assert scale_out is None and partial is None
+    assert partial is None
+    if block_quant_fp8:
+        assert scale_out is not None
+        norm_out = norm_out.float() * scale_out.repeat_interleave(128, dim=-1)
+    else:
+        assert scale_out is None
     parts = [torch.empty_like(x) for _ in range(world)]
     dist.all_gather(parts, x)
     gt32 = torch.stack(parts).float().sum(0) + res.float()
     gtn = gt32 * torch.rsqrt(gt32.pow(2).mean(-1, keepdim=True) + EPS) * w.float()
     scale = gtn.abs().max().item() or 1.0
     assert (residual_out.float() - gt32).abs().max().item() <= 2e-2
-    assert (norm_out.float() - gtn).abs().max().item() <= 0.02 * scale + 0.01
+    tolerance = 0.07 if block_quant_fp8 else 0.02
+    assert (norm_out.float() - gtn).abs().max().item() <= tolerance * scale + 0.01
     # replicated contract: identical on every rank
     g = [torch.empty_like(norm_out) for _ in range(world)]
     dist.all_gather(g, norm_out)
@@ -1024,3 +1033,212 @@ def test_workspace_all_gather_freezes_the_workspace_only_when_served():
     finally:
         manager.graph_consumed = consumed_before
     dist.barrier()
+
+
+@pytest.mark.parametrize("reason", ["unavailable", "token_limit", "fp16"])
+def test_mnnvl_group_fp8_scope_fallback(reason):
+    from tokenspeed_kernel.ops.communication import trtllm as comm
+
+    rank, device = _setup()
+    manager = comm._manager_for_group(dist.group.WORLD)
+    # Earlier cases may have captured the shared workspace. Their graphs are
+    # gone; use a fresh workspace for the larger-row boundary test.
+    manager.cleanup()
+    assert comm.ensure_workspace_initialized(rank, dist.group.WORLD, 2049, 4096)
+    saved = manager.mnnvl_workspace
+    if reason == "unavailable":
+        manager.mnnvl_workspace = None
+    try:
+        tokens = 2049 if reason == "token_limit" else 8
+        dtype = torch.float16 if reason == "fp16" else torch.bfloat16
+        torch.manual_seed(912 + rank)
+        x = torch.randn(tokens, 4096, dtype=dtype, device=device) * 0.1
+        torch.manual_seed(712)
+        residual = torch.randn_like(x) * 0.1
+        weight = torch.ones(4096, dtype=dtype, device=device)
+        args = dict(
+            input_tensor=x,
+            residual=residual,
+            weight=weight,
+            rank=rank,
+            group=dist.group.WORLD,
+            eps=1e-5,
+            max_token_num=2049,
+            use_oneshot=None,
+            trigger_completion_at_end=False,
+            fp32_acc=False,
+            launch_with_pdl=None,
+        )
+        expected, expected_residual, _, _ = comm.allreduce_residual_rmsnorm(
+            **args,
+            block_quant_fp8=False,
+        )
+        values, updated, scales = comm.mnnvl_allreduce_residual_rmsnorm_fp8(**args)
+        assert scales is None
+        assert values.dtype == dtype
+        assert torch.equal(values, expected)
+        assert torch.equal(updated, expected_residual)
+    finally:
+        torch.cuda.synchronize()
+        manager.mnnvl_workspace = saved
+        manager.cleanup()
+    dist.barrier()
+
+
+@pytest.mark.parametrize("pdl,completion", [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize(
+    "tokens,fp32_acc",
+    [(m, False) for m in (1, 8, 16, 32, 64, 1024, 2048)] + [(8, True), (32, True)],
+)
+def test_mnnvl_group_fp8_matches_standalone_quantization(
+    tokens, fp32_acc, pdl, completion
+):
+    from tokenspeed_kernel.ops.communication import trtllm as comm
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
+    from tokenspeed_kernel.platform import current_platform
+
+    if not current_platform().is_hopper:
+        pytest.skip("MNNVL group-128 FP8 is Hopper only")
+    rank, device = _setup()
+    assert comm.ensure_workspace_initialized(rank, dist.group.WORLD, 2048, 4096)
+    workspace = comm._manager_for_group(dist.group.WORLD).mnnvl_workspace
+    if workspace is None:
+        pytest.skip("MNNVL workspace unavailable")
+    assert workspace.supports(tokens, 4096, torch.bfloat16, dist.get_world_size(), 6)
+    x = torch.empty((tokens, 4096), dtype=torch.bfloat16, device=device)
+    residual = torch.empty_like(x)
+    torch.manual_seed(1234)
+    weight = (0.75 + torch.rand(4096, device=device) / 2).bfloat16()
+
+    def run():
+        common = dict(
+            input_tensor=x,
+            residual=residual,
+            weight=weight,
+            rank=rank,
+            group=dist.group.WORLD,
+            eps=1e-5,
+            max_token_num=2048,
+            trigger_completion_at_end=completion,
+            fp32_acc=fp32_acc,
+            launch_with_pdl=pdl,
+        )
+        from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+            AllReduceFusionPattern,
+            trtllm_allreduce_fusion,
+        )
+
+        # Pin the reference to MNNVL too; TP2/2K ordinary AR defaults to IPC.
+        norm, expected_residual = torch.empty_like(x), torch.empty_like(x)
+        trtllm_allreduce_fusion(
+            allreduce_in=x,
+            world_size=dist.get_world_size(),
+            world_rank=rank,
+            token_num=tokens,
+            hidden_dim=4096,
+            workspace_ptrs=workspace,
+            pattern_code=AllReduceFusionPattern.kARResidualRMSNorm,
+            residual_in=residual,
+            residual_out=expected_residual,
+            norm_out=norm,
+            rms_gamma=weight,
+            rms_eps=1e-5,
+            launch_with_pdl=pdl,
+            trigger_completion_at_end=completion,
+            fp32_acc=fp32_acc,
+        )
+        q, scales = quantize_fp8(
+            norm,
+            granularity="token_group",
+            group_size=128,
+            scale_encoding="float32",
+            enable_pdl=False,  # The standalone TRT-LLM quantizer has no PDL option.
+            override="trtllm_quantize_fp8_mn_major",
+        )
+        fused_q, fused_residual, fused_scales = (
+            comm.mnnvl_allreduce_residual_rmsnorm_fp8(
+                **common,
+                use_oneshot=None,
+            )
+        )
+        return q, scales, expected_residual, fused_q, fused_scales, fused_residual
+
+    def fill(seed):
+        torch.manual_seed(seed + rank)
+        x.normal_(std=0.1)
+        torch.manual_seed(seed)
+        residual.normal_(std=0.1)
+        x[0].zero_()
+        residual[0].zero_()
+
+    def check(outputs):
+        q, scales, expected_residual, fused_q, fused_scales, fused_residual = outputs
+        assert torch.equal(fused_q.view(torch.uint8), q.view(torch.uint8))
+        assert torch.equal(fused_scales, scales)
+        assert torch.equal(fused_residual, expected_residual)
+        assert fused_scales.stride() == (1, (tokens + 3) // 4 * 4)
+        assert torch.isfinite(fused_scales).all()
+        assert torch.isfinite(fused_q.float()).all()
+
+    fill(17)
+    check(run())
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outputs = run()
+    for seed in (71, 93):
+        fill(seed)
+        graph.replay()
+        check(outputs)
+
+
+@pytest.mark.parametrize(
+    "invalid_scale", ["missing", "dtype", "layout", "shape", "stride"]
+)
+def test_mnnvl_group_fp8_rejects_invalid_scale(invalid_scale):
+    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+        AllReduceFusionPattern,
+        trtllm_allreduce_fusion,
+    )
+
+    if not current_platform().is_hopper:
+        pytest.skip("MNNVL group-128 FP8 is Hopper only")
+    ws = _skip_unless_mnnvl()
+    x = torch.zeros((8, 4096), device=ws["dev"], dtype=torch.bfloat16)
+    scales = torch.empty((32, 8), device=x.device, dtype=torch.float32).t()
+    if invalid_scale == "missing":
+        scales = None
+    elif invalid_scale == "dtype":
+        scales = scales.bfloat16()
+    elif invalid_scale == "layout":
+        scales = scales.contiguous()
+    elif invalid_scale == "shape":
+        scales = scales[:, :31]
+    elif invalid_scale == "stride":
+        scales = torch.empty((32, 9), device=x.device, dtype=torch.float32).t()[:8]
+    with pytest.raises(RuntimeError):
+        trtllm_allreduce_fusion(
+            allreduce_in=x,
+            world_size=ws["world"],
+            world_rank=ws["rank"],
+            token_num=8,
+            hidden_dim=4096,
+            workspace_ptrs=ws["mhc"],
+            trigger_completion_at_end=True,
+            fp32_acc=False,
+            launch_with_pdl=False,
+            pattern_code=AllReduceFusionPattern.kARResidualRMSNormFP8BlockWiseQuant,
+            residual_in=x,
+            residual_out=torch.empty_like(x),
+            rms_gamma=torch.ones(4096, device=x.device, dtype=x.dtype),
+            rms_eps=1e-5,
+            quant_out=torch.empty_like(x, dtype=torch.float8_e4m3fn),
+            scale_out=scales,
+        )
+    torch.cuda.synchronize()  # Rejection must not poison the CUDA context.

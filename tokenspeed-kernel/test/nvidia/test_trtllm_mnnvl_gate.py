@@ -337,3 +337,124 @@ def test_mhc_lost_workspace_raises_before_launch(admitted_mhc):
     with pytest.raises(RuntimeError, match="prepared MNNVL workspace"):
         comm.allreduce_mhc_post_norm(**args)
     launch.assert_not_called()
+
+
+@pytest.mark.parametrize("world", [2, 4, 8, 16])
+@pytest.mark.parametrize(
+    "arch,dtype,tokens,width,rs_residual,expected",
+    [
+        (9, torch.bfloat16, 1, 4096, False, True),
+        (9, torch.bfloat16, 2048, 4096, False, True),
+        (9, torch.bfloat16, 0, 4096, False, False),
+        (9, torch.bfloat16, 2049, 4096, False, False),
+        (9, torch.bfloat16, 8, 4160, False, False),
+        (9, torch.bfloat16, 8, 4096, True, False),
+        (9, torch.float16, 8, 4096, False, False),
+        (10, torch.bfloat16, 8, 4096, False, False),
+    ],
+)
+def test_mnnvl_group_fp8_admission(
+    monkeypatch, world, arch, dtype, tokens, width, rs_residual, expected
+):
+    from dataclasses import replace
+
+    from tokenspeed_kernel.platform import ArchVersion
+    from tokenspeed_kernel.thirdparty.cuda import trtllm as native
+
+    # Mock hardware metadata only; admission runs on the real workspace class.
+    platform = replace(current_platform(), arch_version=ArchVersion(arch, 0))
+    monkeypatch.setattr(native, "current_platform", lambda: platform)
+    workspace = native.MnnvlAllReduceFusionWorkspace(
+        tp_rank=0,
+        tp_size=world,
+        max_token_num=2048,
+        hidden_dim=4096,
+        buffer_size_bytes=2048 * 8 * 4096 * 2,
+        multicast_ptr=1,
+        local_ptr=1,
+        peer_ptrs=None,
+        buffer_flags=None,
+        oneshot_token_cap=16,
+        refs=(),
+    )
+    assert (
+        workspace.supports(
+            tokens,
+            width,
+            dtype,
+            world,
+            native.AllReduceFusionPattern.kARResidualRMSNormFP8BlockWiseQuant,
+            use_oneshot=None,
+            residual_reduce_scattered=rs_residual,
+        )
+        is expected
+    )
+    # Neither the Hopper restriction nor BF16 restriction applies to ordinary AR+norm.
+    assert workspace.supports(
+        world,
+        4096,
+        dtype,
+        world,
+        native.AllReduceFusionPattern.kARResidualRMSNorm,
+        use_oneshot=None,
+        residual_reduce_scattered=False,
+    )
+
+
+@pytest.mark.parametrize("available", [False, True])
+@pytest.mark.parametrize(
+    "arch,dtype,tokens",
+    [
+        (9, torch.bfloat16, 8),
+        (9, torch.bfloat16, 2048),
+        (9, torch.bfloat16, 2049),
+        (9, torch.float16, 8),
+        (10, torch.bfloat16, 8),
+    ],
+)
+def test_group_fp8_legacy_ipc_routing(monkeypatch, available, arch, dtype, tokens):
+    from dataclasses import replace
+
+    from tokenspeed_kernel.platform import ArchVersion
+    from tokenspeed_kernel.thirdparty.cuda import trtllm as native
+
+    # Only hardware metadata is substituted; both routing and workspaces are real.
+    platform = replace(current_platform(), arch_version=ArchVersion(arch, 0))
+    monkeypatch.setattr(native, "current_platform", lambda: platform)
+    manager = comm.TrtllmFusionWorkspaceManager()
+    manager.world_size = 2
+    manager.use_fp32_lamport = False
+    manager.workspace_tensor = torch.empty(0, dtype=torch.int64)
+    manager.mnnvl_workspace = (
+        native.MnnvlAllReduceFusionWorkspace(
+            tp_rank=0,
+            tp_size=2,
+            max_token_num=2048,
+            hidden_dim=4096,
+            buffer_size_bytes=2048 * 2 * 4096 * 2,
+            multicast_ptr=1,
+            local_ptr=1,
+            peer_ptrs=None,
+            buffer_flags=None,
+            oneshot_token_cap=64,
+            refs=(),
+        )
+        if available
+        else None
+    )
+
+    def select():
+        return comm._ar_fusion_workspace(
+            manager,
+            tokens,
+            4096,
+            dtype,
+            native.AllReduceFusionPattern.kARResidualRMSNormFP8BlockWiseQuant,
+            False,
+            ipc_oneshot=True,
+        )
+
+    # The opt-in MNNVL entry must not change any legacy FP8 caller's backend.
+    assert select() is manager.workspace_tensor
+    manager.workspace_tensor = None
+    assert select() is None

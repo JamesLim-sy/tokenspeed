@@ -290,7 +290,8 @@ __global__ void __launch_bounds__(1024)
   int const packed_idx = cluster.thread_rank();
   int const token_dim = params.hidden_dim;
   int const access_id = token_id * (token_dim / VEC_SIZE) + packed_idx;
-  FusedOp<Pattern, T> fused_op(params, access_id, packed_idx);
+  FusedOp<Pattern, T, Pattern == AllReduceFusionPattern::kARResidualRMSNormFP8BlockWiseQuant>
+      fused_op(params, access_id, packed_idx);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
@@ -419,7 +420,8 @@ __global__ void __launch_bounds__(1024)
   int const local_token = token_id / NRanks;
   int const tokens_per_rank = ceil_div<int>(num_tokens, NRanks);
   bool const is_owner = (owner == params.rank);
-  FusedOp<Pattern, T> fused_op(params, access_id, packed_idx);
+  FusedOp<Pattern, T, Pattern == AllReduceFusionPattern::kARResidualRMSNormFP8BlockWiseQuant>
+      fused_op(params, access_id, packed_idx);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
@@ -685,6 +687,13 @@ cudaError_t mnnvl_allreduce_fusion_op(AllReduceFusionParams<T> const& params,
       return mnnvl_allreduce_fusion_kernel_launcher<AllReduceFusionPattern::kARResidualRMSNorm, \
                                                     T, NRanks>(params, comm, launch_with_pdl, \
                                                                fp32_acc);                    \
+    case AllReduceFusionPattern::kARResidualRMSNormFP8BlockWiseQuant:                        \
+      if constexpr (std::is_same_v<T, __nv_bfloat16>) {                                      \
+        return mnnvl_allreduce_fusion_kernel_launcher<                                      \
+            AllReduceFusionPattern::kARResidualRMSNormFP8BlockWiseQuant, T, NRanks>(          \
+            params, comm, launch_with_pdl, fp32_acc);                                        \
+      }                                                                                    \
+      FLASHINFER_ERROR("mnnvl group-128 FP8 requires BF16");                                 \
     case AllReduceFusionPattern::kARResidualAttnResCombine:                                  \
       return mnnvl_allreduce_fusion_kernel_launcher<                                         \
           AllReduceFusionPattern::kARResidualAttnResCombine, T, NRanks>(params, comm,        \
@@ -698,7 +707,8 @@ cudaError_t mnnvl_allreduce_fusion_op(AllReduceFusionParams<T> const& params,
     default:                                                                                 \
       FLASHINFER_CHECK(false,                                                                \
                        "mnnvl allreduce fusion: unsupported pattern (supported: "            \
-                       "kAllReduce, kARResidualRMSNorm, kARResidualAttnResCombine, "         \
+                       "kAllReduce, kARResidualRMSNorm, kARResidualRMSNormFP8BlockWiseQuant, "   \
+                       "kARResidualAttnResCombine, "         \
                        "kAllReduceLatentNorm)");                                             \
   }
 

@@ -35,7 +35,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.thirdparty.cuda.cuda_ipc import (
     create_shared_buffer,
     cudart,
@@ -304,6 +304,7 @@ _MNNVL_SUPPORTED_PATTERNS = frozenset(
     {
         AllReduceFusionPattern.kAllReduce,
         AllReduceFusionPattern.kARResidualRMSNorm,
+        AllReduceFusionPattern.kARResidualRMSNormFP8BlockWiseQuant,
         AllReduceFusionPattern.kARResidualAttnResCombine,
         # kAllReduceLatentNorm: the mnnvl kernel handles it, but the wide
         # [latent|hidden] lane makes it a hair slower than IPC lamport on a
@@ -430,6 +431,13 @@ class MnnvlAllReduceFusionWorkspace:
             return False
         if pattern_code not in _MNNVL_SUPPORTED_PATTERNS:
             return False
+        if pattern_code == AllReduceFusionPattern.kARResidualRMSNormFP8BlockWiseQuant:
+            if (
+                not current_platform().is_hopper
+                or dtype != torch.bfloat16
+                or hidden_dim % 128
+            ):
+                return False
         # token_num <= 0 would reach cudaLaunchKernelEx with gridDim.x = 0:
         # the launch fails with a STICKY invalid-argument error that poisons
         # the CUDA context, unlike every other rejected shape which raises a
@@ -871,6 +879,8 @@ def trtllm_allreduce_fusion(
             attnres_res_w,
             attnres_out_norm_w,
             latent_width,
+            quant_out,
+            scale_out,
         )
         return
 

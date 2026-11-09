@@ -515,16 +515,16 @@ class SandwichNormFusedOp {
   vec_t<T, VEC_SIZE> m_residual;
 };
 
-// The MNNVL kernels name FusedOp<Pattern, T>: route the sandwich patterns here.
+// The MNNVL kernels name FusedOp<Pattern, T, false>: route the sandwich patterns here.
 template <>
-class FusedOp<AllReduceFusionPattern::kARSandwichResidualRMSNorm, __nv_bfloat16>
+class FusedOp<AllReduceFusionPattern::kARSandwichResidualRMSNorm, __nv_bfloat16, false>
     : public SandwichNormFusedOp<false> {
  public:
   using SandwichNormFusedOp<false>::SandwichNormFusedOp;
 };
 
 template <>
-class FusedOp<AllReduceFusionPattern::kARSandwichResidualRMSNormTokenFP8, __nv_bfloat16>
+class FusedOp<AllReduceFusionPattern::kARSandwichResidualRMSNormTokenFP8, __nv_bfloat16, false>
     : public SandwichNormFusedOp<true> {
  public:
   using SandwichNormFusedOp<true>::SandwichNormFusedOp;
