@@ -26,7 +26,13 @@ from tokenspeed_kernel.ops.communication.trtllm import (
 from tokenspeed_kernel.ops.communication.trtllm import (
     reducescatter_residual_rmsnorm as _reducescatter_residual_rmsnorm,
 )
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import (
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
+from tokenspeed_kernel.registry import register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 _ALLREDUCE_FUSION_LANE: torch.Tensor | None = None
 
@@ -127,6 +133,18 @@ def allreduce_lane_latent_norm(
     )
 
 
+@register_kernel(
+    "communication",
+    "allreduce_residual_rmsnorm",
+    name="native_allreduce_residual_rmsnorm",
+    solution="native",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures(
+        ("input", "residual", "weight"),
+        "dense",
+        {torch.bfloat16, torch.float16, torch.float32},
+    ),
+)
 def allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,

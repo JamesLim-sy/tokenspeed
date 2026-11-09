@@ -21,6 +21,14 @@
 from collections.abc import Sequence
 
 import torch
+from tokenspeed_kernel.ops.layernorm import rmsnorm
+from tokenspeed_kernel.selection import (
+    KernelPlan,
+    NoKernelFoundError,
+    resolve_kernel_override,
+    select_kernel,
+)
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
@@ -30,6 +38,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     token_reduce_scatter,
 )
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
+from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan, scatter_count
 
@@ -775,19 +784,114 @@ class CommManager:
     def post_attn_reduce_norm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):
-        if self.should_fuse(hidden_states.shape[0]):
-            hidden_states, residual, *_ = (
-                self.post_attn_layernorm.forward_with_allreduce_fusion(
-                    self.mapping.attn.tp_rank,
-                    self.mapping.attn.tp_group,
-                    hidden_states,
-                    residual,
-                )
+        """Run registered AR+norm, retaining the ordinary communication fallback."""
+        # layernorm imports the distributed package: keep this import lazy.
+        from tokenspeed.runtime.layers.layernorm import RMSNorm
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        norm = self.post_attn_layernorm
+        if (
+            self.should_fuse(hidden_states.shape[0])
+            and isinstance(norm, RMSNorm)
+            and norm.kernel is rmsnorm
+        ):
+            override = resolve_kernel_override(
+                "communication", "allreduce_residual_rmsnorm", None
             )
-        else:
-            hidden_states, residual = self.post_attn_comm(hidden_states, residual, ctx)
-            hidden_states, residual = self.post_attn_layernorm(hidden_states, residual)
-        return hidden_states, residual
+            try:
+                # Selection is cached by dtype and static geometry, not batch size.
+                kernel = select_kernel(
+                    "communication",
+                    "allreduce_residual_rmsnorm",
+                    format_signature(
+                        input=dense_tensor_format(hidden_states.dtype),
+                        residual=dense_tensor_format(residual.dtype),
+                        weight=dense_tensor_format(norm.weight.dtype),
+                    ),
+                    traits={
+                        "hidden_size": hidden_states.shape[1],
+                        "tp_size": self.mapping.attn.tp_size,
+                    },
+                    override=override,
+                )
+            except NoKernelFoundError:
+                if override is not None:
+                    raise
+            else:
+                result = kernel(
+                    input_tensor=hidden_states,
+                    residual=residual,
+                    weight=norm.weight,
+                    rank=self.mapping.attn.tp_rank,
+                    group=process_group_manager.get_device_process_group(
+                        self.mapping.attn.tp_group
+                    ),
+                    eps=norm.variance_epsilon,
+                    max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
+                    block_quant_fp8=False,
+                )
+                if result[0] is not None:
+                    return result[0], result[1]
+        hidden_states, residual = self.post_attn_comm(hidden_states, residual, ctx)
+        return norm(hidden_states, residual)
+
+    def post_attn_reduce_norm_with_scale(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
+        *,
+        quantization_plan: KernelPlan | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Run AR+norm with a preselected FP8 plan, or the ordinary path for None.
+
+        Return activations, updated residual, and optional FP32 group-128 scales.
+        Consumers quantize if scales are None; otherwise reuse the scale view
+        and retain the original input dtype for projection outputs.
+        """
+        if quantization_plan is None or not self.should_fuse(hidden_states.shape[0]):
+            hidden_states, residual = self.post_attn_reduce_norm(
+                hidden_states, residual, ctx
+            )
+            return hidden_states, residual, None
+
+        from tokenspeed.runtime.layers.layernorm import RMSNorm
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        norm = self.post_attn_layernorm
+        if not isinstance(norm, RMSNorm) or norm.kernel is not rmsnorm:
+            raise ValueError("A selected/custom norm cannot use all-reduce fusion")
+
+        quantization_plan.validate(
+            "communication",
+            "allreduce_residual_rmsnorm_fp8",
+            format_signature(
+                input=dense_tensor_format(hidden_states.dtype),
+                residual=dense_tensor_format(residual.dtype),
+                weight=dense_tensor_format(norm.weight.dtype),
+            ),
+            traits={
+                "hidden_size": hidden_states.shape[1],
+                "tp_size": self.mapping.attn.tp_size,
+                "m": hidden_states.shape[0],
+                "group_size": 128,
+                "scale_encoding": "float32",
+            },
+            features=frozenset(),
+            solution=None,
+            override=None,
+        )
+        return quantization_plan.kernel(
+            hidden_states,
+            residual,
+            norm.weight,
+            rank=self.mapping.attn.tp_rank,
+            group=process_group_manager.get_device_process_group(
+                self.mapping.attn.tp_group
+            ),
+            eps=norm.variance_epsilon,
+            max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
+        )
 
     def post_mlp_fused(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
